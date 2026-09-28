@@ -10914,6 +10914,7 @@ static int                                                     g_previousPlace =
 static std::unordered_map<int, std::vector<PHLWINDOWREF>>      g_placeOrder;
 static std::unordered_map<const Desktop::View::CWindow*, CBox> g_placeTiled; // where tiling last put each window
 static std::unordered_set<const Desktop::View::CWindow*>       g_placeOpened; // new, so they tile last rather than where they were dropped
+static std::unordered_set<const Desktop::View::CWindow*>       g_placeFloating; // resized or SUPER + T'd out of the tiling, in a tiled place
 static int                                                     g_placeHeldButtons = 0;
 static bool                                                    g_placeReleased    = false;
 
@@ -10925,6 +10926,7 @@ static void notePlaceWindow(const PHLWINDOW& window, bool opened) {
     else {
         g_placeOpened.erase(window.get());
         g_placeTiled.erase(window.get());
+        g_placeFloating.erase(window.get());
     }
 }
 
@@ -11088,7 +11090,8 @@ static CBox placeWindowBox(const PHLWINDOW& window) {
 static bool placeTileable(const PHLWINDOW& window) {
     const auto TARGET = window ? window->layoutTarget() : nullptr;
     return shouldShowOverviewWindow(window) && TARGET && TARGET->floating() && !window->m_pinned && !Fullscreen::controller()->isFullscreen(window) &&
-        !(window->m_workspace && window->m_workspace->m_isSpecialWorkspace) && !g_canvasFill.contains(window.get());
+        !(window->m_workspace && window->m_workspace->m_isSpecialWorkspace) && !g_canvasFill.contains(window.get()) &&
+        !g_placeFloating.contains(window.get());
 }
 
 static std::vector<PHLWINDOW> placeMembers(int place, const PHLMONITOR& monitor) {
@@ -11211,9 +11214,18 @@ void CScrollOverview::reconcilePlaces() {
         const auto MONITOR = placeMonitor(place);
         if (!MONITOR)
             continue;
+        // Resized away from its tile (by mouse, key or the app), a window
+        // leaves the tiling and keeps its size.
+        bool changed = false;
+        for (const auto& window : placeMembers(place, MONITOR))
+            if (const auto IT = g_placeTiled.find(window.get());
+                IT != g_placeTiled.end() && (std::abs(placeWindowBox(window).width - IT->second.width) > 2.0 || std::abs(placeWindowBox(window).height - IT->second.height) > 2.0)) {
+                g_placeFloating.emplace(window.get());
+                g_placeTiled.erase(IT);
+                changed = true;
+            }
         const auto MEMBERS = placeMembers(place, MONITOR);
         size_t     live    = 0;
-        bool       changed = false;
         for (const auto& ref : g_placeOrder[place]) {
             const auto WINDOW = ref.lock();
             if (!WINDOW || !std::ranges::contains(MEMBERS, WINDOW))
@@ -11225,12 +11237,39 @@ void CScrollOverview::reconcilePlaces() {
         if (!changed && DROPPED)
             changed = std::ranges::any_of(MEMBERS, [](const PHLWINDOW& window) {
                 const auto IT = g_placeTiled.find(window.get());
-                return IT == g_placeTiled.end() || placeWindowBox(window).pos().distanceSq(IT->second.pos()) > 4.0 ||
-                    placeWindowBox(window).size().distanceSq(IT->second.size()) > 4.0;
+                return IT == g_placeTiled.end() || placeWindowBox(window).pos().distanceSq(IT->second.pos()) > 4.0;
             });
         if (changed)
             tilePlace(place, MONITOR, DROPPED);
     }
+}
+
+// SUPER + T in a tiled place: the window leaves the tiling, floating over the
+// middle of the place, or joins it again where it is. False outside one.
+bool canvasToggleTiled(PHLWINDOW window) {
+    window            = getOverviewWindowToShow(window);
+    const auto TARGET = window ? window->layoutTarget() : nullptr;
+    if (!TARGET || !tilingPlaces() || !shouldShowOverviewWindow(window) || window->m_pinned || g_canvasFill.contains(window.get()))
+        return false;
+    const auto CENTER = placeWindowBox(window).middle();
+    for (int place = 1; place <= 10; ++place) {
+        const auto MONITOR = placeMonitor(place);
+        if (!MONITOR || !placeWorldBox(place, MONITOR).containsPoint(CENTER))
+            continue;
+        if (!g_placeFloating.erase(window.get())) {
+            g_placeFloating.emplace(window.get());
+            g_placeTiled.erase(window.get());
+            const auto AREA = canvasFillArea(MONITOR, nullptr).translate(placeCamera(place));
+            const auto SIZE = Vector2D{std::round(AREA.width * 0.7), std::round(AREA.height * 0.6)};
+            const CBox BOX{AREA.middle() - SIZE / 2.0, SIZE};
+            TARGET->rememberFloatingSize(BOX.size());
+            TARGET->setPositionGlobal(BOX);
+            window->sendWindowSize(true);
+        }
+        tilePlace(place, MONITOR, false);
+        return true;
+    }
+    return false;
 }
 
 // SUPER + SHIFT + arrows in a tiled place swap the window with its neighbour

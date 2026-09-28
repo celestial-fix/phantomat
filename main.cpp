@@ -458,6 +458,7 @@ std::string canvasStateJson();
 static SP<SHyprCtlCommand> g_stateCommand;
 void canvasFullscreenReset();
 bool canvasToggleFill(PHLWINDOW window);
+bool canvasToggleTiled(PHLWINDOW window); // scrollOverview.cpp
 bool canvasTogglePin(PHLWINDOW window);
 void notePlacePointerButton(bool pressed);
 
@@ -628,6 +629,10 @@ static SDispatchResult onCanvasDispatcher(std::string arg) {
         requestFlightDeckNative(Desktop::focusState()->window(), arg == "fullscreen" ? Fullscreen::FSMODE_FULLSCREEN : arg == "maximize" ? Fullscreen::FSMODE_MAXIMIZED : Fullscreen::FSMODE_NONE);
         return {};
     }
+    if (arg == "float")
+        return canvasToggleTiled(Desktop::focusState()->window()) || canvasToggleFill(Desktop::focusState()->window()) ?
+            SDispatchResult{} :
+            SDispatchResult{.success = false, .error = "Open the canvas before using this action"};
     if (arg == "fill")
         return canvasToggleFill(Desktop::focusState()->window()) ? SDispatchResult{} : SDispatchResult{.success = false, .error = "Open the canvas before using this action"};
     if (arg == "pin")
