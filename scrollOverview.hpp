@@ -69,6 +69,7 @@ class CScrollOverview : public IOverview {
     void         refreshCanvasSettings();
     bool         flightDeckAction(const std::string& action);
     bool         canvasPlaceAction(const std::string& action);
+    bool         linkedPlaceAction(const std::string& action);
     bool         nudgeInPlace(PHLWINDOW window, const Vector2D& direction);
     bool         placeClick(const Vector2D& world, const Vector2D& local);
     int          placeCloseAt(const Vector2D& local) const;

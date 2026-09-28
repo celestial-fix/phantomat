@@ -10897,8 +10897,10 @@ bool CScrollOverview::flightDeckAction(const std::string& action) {
 // SUPER + 1…0 go to a place on the canvas, SHIFT + SUPER + N sends the focused
 // window there and follows it (SHIFT + ALT + SUPER + N: without following),
 // SUPER + TAB / SHIFT + SUPER + TAB step through the places of the screen you
-// are on, CTRL + SUPER + TAB goes back to the place before. A place is one
-// screen's worth of canvas and belongs to one screen: the one it was first
+// are on, CTRL + SUPER + TAB goes back to the place before. On linked screens
+// a place is a view of the whole desk (linkedPlaceAction, at the end). With
+// the screens on their own, a place is one screen's worth of canvas and
+// belongs to one screen: the one it was first
 // visited from, unless canvas:place_monitors names one, until SHIFT + ALT +
 // SUPER + arrows move it (and its windows) to another screen. Where places
 // are is remembered across restarts. Place N is column N of the canvas, a
@@ -11073,8 +11075,14 @@ static CBox placeWorldBox(int place, const PHLMONITOR& monitor) {
     return monitor->logicalBox().translate(placeCamera(place));
 }
 
+// Screens on their own (canvas:linked_screens off) each have places of their
+// own; linked, a place is a view of the whole desk (linkedPlaceAction).
+static bool screenPlaces() {
+    return ScrollOverview::Config::getCanvasPlaces() && !ScrollOverview::Config::getCanvasLinkedScreens();
+}
+
 static int placeAt(const PHLMONITOR& monitor, const Vector2D& world) {
-    if (!monitor || !ScrollOverview::Config::getCanvasPlaces())
+    if (!monitor || !screenPlaces())
         return 0;
     for (int place = 1; place <= 10; ++place)
         if (placeMonitor(place) == monitor && placeWorldBox(place, monitor).containsPoint(world))
@@ -11194,7 +11202,7 @@ static void tilePlace(int place, const PHLMONITOR& monitor, bool dropped) {
 }
 
 static bool tilingPlaces() {
-    return ScrollOverview::Config::getCanvasPlaces() && ScrollOverview::Config::getCanvasTilePlaces();
+    return screenPlaces() && ScrollOverview::Config::getCanvasTilePlaces();
 }
 
 // Every frame, once for all screens: a place whose windows changed tiles
@@ -11370,7 +11378,7 @@ std::optional<SPlaceChrome> CScrollOverview::placeChrome(int place, const PHLMON
 
 int CScrollOverview::placeCloseAt(const Vector2D& local) const {
     const auto MONITOR = pMonitor.lock();
-    if (!MONITOR || !ScrollOverview::Config::getCanvasPlaces() || !isCanvasNavigationActive())
+    if (!MONITOR || !screenPlaces() || !isCanvasNavigationActive())
         return 0;
     for (int place = 1; place <= 10; ++place)
         if (const auto CHROME = placeChrome(place, MONITOR); CHROME && CHROME->close.containsPoint(local))
@@ -11380,7 +11388,7 @@ int CScrollOverview::placeCloseAt(const Vector2D& local) const {
 
 int CScrollOverview::placeBadgeAt(const Vector2D& local) const {
     const auto MONITOR = pMonitor.lock();
-    if (!MONITOR || !ScrollOverview::Config::getCanvasPlaces() || !isCanvasNavigationActive())
+    if (!MONITOR || !screenPlaces() || !isCanvasNavigationActive())
         return 0;
     for (int place = 1; place <= 10; ++place)
         if (const auto CHROME = placeChrome(place, MONITOR); CHROME && CHROME->badge.containsPoint(local))
@@ -11402,7 +11410,7 @@ static void removePlace(int place) {
 // Zoomed out, each place a screen has is outlined and numbered, just outside
 // it, since tiled windows cover all of it.
 void CScrollOverview::renderPlaceOutlines(PHLMONITOR monitor) {
-    if (!monitor || !ScrollOverview::Config::getCanvasPlaces() || !isCanvasNavigationActive())
+    if (!monitor || !screenPlaces() || !isCanvasNavigationActive())
         return;
     const float FADE = overviewProgress();
     if (FADE <= 0.01F)
@@ -11457,6 +11465,8 @@ bool CScrollOverview::canvasPlaceAction(const std::string& action) {
     // nothing on the canvas (and succeed, so bindings skip their fallback).
     if (!ScrollOverview::Config::getCanvasPlaces())
         return true;
+    if (ScrollOverview::Config::getCanvasLinkedScreens())
+        return action.starts_with("go ") || action.starts_with("send ") ? linkedPlaceAction(action) : true;
 
     const auto canvasFor = [this, &MONITOR](const PHLMONITOR& monitor) -> CScrollOverview* {
         return monitor == MONITOR ? this : canvasOf(scrollOverviewForMonitor(monitor));
@@ -11494,14 +11504,7 @@ bool CScrollOverview::canvasPlaceAction(const std::string& action) {
                 g_minimapFlashStart = NOW;
             g_minimapFlashUntil = NOW + std::chrono::milliseconds(1400);
         }
-        // Linked, this screen keeps the lead and the others follow it, so it
-        // moves by what puts that screen at the place.
-        if (TARGETMONITOR != MONITOR && ScrollOverview::Config::getCanvasLinkedScreens()) {
-            const float ZOOM     = std::max(scale->goal(), 0.01F);
-            const auto  DISTANCE = (TARGETMONITOR->m_position + TARGETMONITOR->m_size / 2.0) - (MONITOR->m_position + MONITOR->m_size / 2.0);
-            *viewOffset          = placeCamera(place) - DISTANCE * (1.0 / ZOOM - 1.0);
-        } else
-            *canvas->viewOffset = placeCamera(place);
+        *canvas->viewOffset = placeCamera(place);
         if (TARGETMONITOR != MONITOR) {
             Desktop::focusState()->rawMonitorFocus(TARGETMONITOR);
             Pointer::pointerController()->warpTo(TARGETMONITOR->logicalBox().middle(), true);
@@ -11602,14 +11605,12 @@ bool CScrollOverview::canvasPlaceAction(const std::string& action) {
         if (!to || to == MONITOR || !movePlace(PLACE, to))
             return true;
 
-        if (!ScrollOverview::Config::getCanvasLinkedScreens()) {
-            int stay = g_previousPlace != PLACE && placeMonitor(g_previousPlace) == MONITOR ? g_previousPlace : 0;
-            for (int place = 1; place <= 10 && !stay; ++place)
-                if (placeMonitor(place) == MONITOR)
-                    stay = place;
-            if (stay)
-                *viewOffset = placeCamera(stay);
-        }
+        int stay = g_previousPlace != PLACE && placeMonitor(g_previousPlace) == MONITOR ? g_previousPlace : 0;
+        for (int place = 1; place <= 10 && !stay; ++place)
+            if (placeMonitor(place) == MONITOR)
+                stay = place;
+        if (stay)
+            *viewOffset = placeCamera(stay);
         return go(PLACE);
     }
 
@@ -11914,7 +11915,7 @@ void CScrollOverview::renderPlaceMenu(PHLMONITOR monitor) {
 // opens its menu.
 bool CScrollOverview::placeClick(const Vector2D& world, const Vector2D& local) {
     const auto MONITOR = pMonitor.lock();
-    if (!MONITOR || closing || !isCanvasDesktop() || !ScrollOverview::Config::getCanvasPlaces())
+    if (!MONITOR || closing || !isCanvasDesktop() || !screenPlaces())
         return false;
 
     const double MARGIN = 24.0 / std::max(scale->value(), 0.01F);
@@ -11938,4 +11939,99 @@ bool CScrollOverview::placeClick(const Vector2D& world, const Vector2D& local) {
     placeState().cameras[place]  = Vector2D{std::round(CAMERA.x), std::round(CAMERA.y)};
     savePlaceState();
     return canvasPlaceAction("go " + std::to_string(place));
+}
+
+// ---- Places on linked screens ------------------------------------------------------
+// A place is a view of the canvas (the camera of all screens, at 100%). At
+// first the places are a row, a screen-set apart, with the one numbered after
+// the workspace you were on where you are; each then remembers where you left
+// its camera and which window had focus there.
+struct SLinkedPlace {
+    Vector2D     camera;
+    PHLWINDOWREF focus;
+};
+static std::unordered_map<int, SLinkedPlace> g_linkedPlaces;
+static int                                   g_linkedPlace = 0, g_linkedPreviousPlace = 0, g_linkedAnchor = 0;
+static Vector2D                              g_linkedAnchorCamera;
+
+static Vector2D linkedPlaceCamera(int place) {
+    if (const auto IT = g_linkedPlaces.find(place); IT != g_linkedPlaces.end())
+        return IT->second.camera;
+    return g_linkedAnchorCamera + Vector2D{(place - g_linkedAnchor) * canvasScreensBox().width * 1.5, 0.0};
+}
+
+bool CScrollOverview::linkedPlaceAction(const std::string& action) {
+    const auto MONITOR = pMonitor.lock();
+    if (!MONITOR)
+        return false;
+    // You are at the place of the workspace you were on.
+    if (g_linkedPlace == 0) {
+        const auto ID        = MONITOR->m_activeWorkspace ? MONITOR->m_activeWorkspace->m_id : 1;
+        g_linkedPlace        = ID >= 1 && ID <= 10 ? sc<int>(ID) : 1;
+        g_linkedAnchor       = g_linkedPlace;
+        g_linkedAnchorCamera = viewOffset->goal();
+    }
+
+    // Zoomed out, the view glides there and stays zoomed out, on the minimap;
+    // at 100% the minimap shows for a moment while you travel.
+    const auto go = [this](int place) {
+        if (place < 1 || place > 10)
+            return false;
+        const auto FOCUSED            = getOverviewWindowToShow(Desktop::focusState()->window());
+        g_linkedPlaces[g_linkedPlace] = {.camera = viewOffset->goal(), .focus = FOCUSED};
+        if (place != g_linkedPlace)
+            g_linkedPreviousPlace = g_linkedPlace;
+        g_linkedPlace = place;
+        markCanvasCameraActive(pMonitor.lock());
+        if (!canvasNavigationActive) {
+            const auto NOW = Time::steadyNow();
+            if (NOW >= g_minimapFlashUntil)
+                g_minimapFlashStart = NOW;
+            g_minimapFlashUntil = NOW + std::chrono::milliseconds(1400);
+        }
+        *viewOffset = linkedPlaceCamera(place);
+        // Focus what had it there, or nothing that is not there.
+        const auto REMEMBERED = g_linkedPlaces.contains(place) ? g_linkedPlaces.at(place).focus.lock() : PHLWINDOW{};
+        const auto VIEW       = canvasScreensBox().translate(linkedPlaceCamera(place));
+        if (shouldShowOverviewWindow(REMEMBERED) && VIEW.containsPoint(REMEMBERED->m_realPosition->goal() + REMEMBERED->m_realSize->goal() / 2.0))
+            canvasAdoptFocus(REMEMBERED);
+        else if (FOCUSED && !VIEW.containsPoint(FOCUSED->m_realPosition->goal() + FOCUSED->m_realSize->goal() / 2.0))
+            Desktop::focusState()->fullWindowFocus(nullptr, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
+        damage();
+        return true;
+    };
+
+    if (action.starts_with("go ")) {
+        const auto WHERE = action.substr(3);
+        if (WHERE == "back")
+            return go(g_linkedPreviousPlace ? g_linkedPreviousPlace : g_linkedPlace);
+        // The place next door, empty or not, like the workspace keys: with
+        // all your windows at one place there is still somewhere to go.
+        if (WHERE == "next" || WHERE == "prev")
+            return go(((g_linkedPlace - 1 + (WHERE == "next" ? 1 : -1)) % 10 + 10) % 10 + 1);
+        int place = 0;
+        try { place = std::stoi(WHERE); } catch (...) { return false; }
+        return go(place);
+    }
+
+    // send N [stay]: the focused window to place N, at the same spot on the screen.
+    int place = 0;
+    try { place = std::stoi(action.substr(5)); } catch (...) { return false; }
+    const bool STAY   = action.ends_with(" stay");
+    const auto WINDOW = getOverviewWindowToShow(Desktop::focusState()->window());
+    const auto TARGET = shouldShowOverviewWindow(WINDOW) && !WINDOW->m_pinned ? WINDOW->layoutTarget() : nullptr;
+    if (place < 1 || place > 10 || !TARGET || place == g_linkedPlace)
+        return place >= 1 && place <= 10;
+    checkpointCanvas();
+    const auto DELTA = linkedPlaceCamera(place) - viewOffset->goal();
+    TARGET->setPositionGlobal(CBox{WINDOW->m_realPosition->goal() + DELTA, WINDOW->m_realSize->goal()});
+    TARGET->warpPositionSize();
+    WINDOW->sendWindowSize(true);
+    if (STAY) {
+        Desktop::focusState()->fullWindowFocus(nullptr, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
+        return true;
+    }
+    go(place);
+    canvasAdoptFocus(WINDOW);
+    return true;
 }
