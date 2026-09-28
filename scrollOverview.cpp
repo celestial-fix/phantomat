@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cctype>
+#include <cstdio>
 #include <dlfcn.h>
 #include <unistd.h>
 #include <filesystem>
@@ -1808,6 +1809,18 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
                     navigatorSwallowedButtons.emplace(event.button);
                     if (HIT >= 0 && ROWWINDOW)
                         landOnWindow(ROWWINDOW);
+                    requestInputFrame();
+                    return;
+                }
+            }
+
+            if (event.button == (LEFT_HANDED ? BTN_LEFT : BTN_RIGHT) && event.state == WL_POINTER_BUTTON_STATE_PRESSED && MONITOR && !WINDOWGESTURE && !clientGestureButton &&
+                ScrollOverview::Config::getCanvasPlaces() && !windowAtOverviewCursor() &&
+                !(showsNavigatorHud() && SpatialOverview::Hud::paletteHit(RAWLOCAL) != SpatialOverview::Hud::PALETTE_MISS)) {
+                const auto WORLD = canvasScreenToWorld(CBox{MONITOR->m_position + lastMousePosLocal / MONITOR->m_scale, {}}, false);
+                if (WORLD && placeClick(WORLD->pos())) {
+                    info.cancelled = true;
+                    navigatorSwallowedButtons.emplace(event.button);
                     requestInputFrame();
                     return;
                 }
@@ -10866,7 +10879,8 @@ bool CScrollOverview::flightDeckAction(const std::string& action) {
 // visited from, unless canvas:place_monitors names one, until SHIFT + ALT +
 // SUPER + arrows move it (and its windows) to another screen. Where places
 // are is remembered across restarts. Place N is column N of the canvas, a
-// desk-width and more from the next, on the row of its screen. With
+// desk-width and more from the next, on the row of its screen, unless it was
+// made somewhere else by right-clicking the canvas (placeClick). With
 // canvas:tile_places the windows in a place tile to fill its screen, and
 // each place remembers which window had focus there.
 struct SCanvasPlace {
@@ -10929,26 +10943,54 @@ static std::filesystem::path placeMonitorsPath() {
     return base / "spatial-overview" / "place-monitors";
 }
 
-// Where places were put while running; wins over canvas:place_monitors.
-static std::map<int, std::string>& assignedPlaceMonitors() {
-    static std::optional<std::map<int, std::string>> assigned;
-    if (!assigned) {
+// Where places were put while running; wins over canvas:place_monitors. A
+// line per place, "N:SCREEN", or "N:SCREEN@X,Y" for one made somewhere of its
+// own by right-clicking the canvas (X,Y: its camera).
+struct SPlaceState {
+    std::map<int, std::string> monitors;
+    std::map<int, Vector2D>    cameras;
+};
+
+static SPlaceState& placeState() {
+    static std::optional<SPlaceState> state;
+    if (!state) {
+        state.emplace();
         std::ifstream in{placeMonitorsPath()};
-        std::string   text{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
-        assigned = parsePlaceMonitors(text);
+        std::string   line;
+        while (std::getline(in, line)) {
+            const auto AT = line.find('@');
+            for (const auto& [place, name] : parsePlaceMonitors(line.substr(0, AT))) {
+                state->monitors[place] = name;
+                double x = 0, y = 0;
+                if (AT != std::string::npos && std::sscanf(line.c_str() + AT + 1, "%lf,%lf", &x, &y) == 2)
+                    state->cameras[place] = Vector2D{x, y};
+            }
+        }
     }
-    return *assigned;
+    return *state;
 }
 
-static void assignPlaceMonitor(int place, const std::string& monitor) {
-    auto& assigned  = assignedPlaceMonitors();
-    assigned[place] = monitor;
+static void savePlaceState() {
+    const auto&     STATE = placeState();
     std::error_code error;
     const auto      PATH = placeMonitorsPath();
     std::filesystem::create_directories(PATH.parent_path(), error);
     std::ofstream out{PATH, std::ios::trunc};
-    for (const auto& [number, name] : assigned)
-        out << number << ':' << name << '\n';
+    for (const auto& [number, name] : STATE.monitors) {
+        out << number << ':' << name;
+        if (const auto IT = STATE.cameras.find(number); IT != STATE.cameras.end())
+            out << '@' << sc<long>(std::lround(IT->second.x)) << ',' << sc<long>(std::lround(IT->second.y));
+        out << '\n';
+    }
+}
+
+static std::map<int, std::string>& assignedPlaceMonitors() {
+    return placeState().monitors;
+}
+
+static void assignPlaceMonitor(int place, const std::string& monitor) {
+    placeState().monitors[place] = monitor;
+    savePlaceState();
 }
 
 static std::optional<std::string> placeMonitorName(int place) {
@@ -10996,6 +11038,8 @@ static CBox canvasScreensBox() {
 
 // Rounded, so a small change to the screens does not move every place.
 static Vector2D placeCamera(int place) {
+    if (const auto IT = placeState().cameras.find(place); IT != placeState().cameras.end())
+        return IT->second;
     const double PITCH = std::max(1000.0, std::ceil(canvasScreensBox().width * 1.25 / 1000.0) * 1000.0);
     return Vector2D{(place - 1) * PITCH, 0.0};
 }
@@ -11499,4 +11543,48 @@ bool CScrollOverview::canvasPlaceAction(const std::string& action) {
     if (auto* canvas = canvasFor(TO))
         canvas->canvasAdoptFocus(WINDOW);
     return true;
+}
+
+// Right-click on the canvas, off any window: on empty canvas, the lowest
+// place no screen has yet is made there, for this screen, centered on the
+// click; inside a place, you go there, or an empty place is taken away.
+bool CScrollOverview::placeClick(const Vector2D& world) {
+    const auto MONITOR = pMonitor.lock();
+    if (!MONITOR || closing || !isCanvasDesktop() || !ScrollOverview::Config::getCanvasPlaces())
+        return false;
+
+    for (int place = 1; place <= 10; ++place) {
+        const auto OWNER = placeMonitor(place);
+        if (!OWNER)
+            continue;
+        const auto BOX = placeWorldBox(place, OWNER);
+        if (!BOX.containsPoint(world))
+            continue;
+        const bool EMPTY = std::ranges::none_of(Desktop::windowState()->windows(), [&BOX](const auto& windowRef) {
+            const auto WINDOW = getOverviewWindowToShow(windowRef);
+            return shouldShowOverviewWindow(WINDOW) && !WINDOW->m_pinned && BOX.containsPoint(placeWindowBox(WINDOW).middle());
+        });
+        if (!EMPTY)
+            return canvasPlaceAction("go " + std::to_string(place));
+        placeState().monitors.erase(place);
+        placeState().cameras.erase(place);
+        savePlaceState();
+        g_places.erase(place);
+        g_placeOrder.erase(place);
+        if (g_previousPlace == place)
+            g_previousPlace = 0;
+        damage();
+        return true;
+    }
+
+    int place = 1;
+    while (place <= 10 && placeMonitorName(place))
+        ++place;
+    if (place > 10)
+        return true;
+    const auto CAMERA = world - MONITOR->logicalBox().middle();
+    placeState().monitors[place] = MONITOR->m_name;
+    placeState().cameras[place]  = Vector2D{std::round(CAMERA.x), std::round(CAMERA.y)};
+    savePlaceState();
+    return canvasPlaceAction("go " + std::to_string(place));
 }
