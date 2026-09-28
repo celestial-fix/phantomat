@@ -122,6 +122,8 @@ static int g_userFollowMouse = 1; // input:follow_mouse as set before the canvas
 static void notePlaceWindow(const PHLWINDOW& window, bool opened);
 static int  placeAt(const PHLMONITOR& monitor, const Vector2D& world);
 static void removePlace(int place);
+static void notePlaceFullscreen(const PHLWINDOW& window, const Fullscreen::SFullscreenMode& modes);
+static void forgetPlaceFullscreen(const PHLWINDOW& window);
 static bool placeTiling(int place);
 static bool canvasSnapDoubleClick(const PHLWINDOW& window, uint32_t timeMs);
 // Going to a place at 100% shows the minimap for a moment (see canvasPlaceAction).
@@ -3983,6 +3985,7 @@ static void canvasPlaceAfterFullscreen(const SCanvasFullscreen& entry, CScrollOv
 
 
 static void canvasFullscreenComeBack(const SCanvasFullscreen& entry) {
+    forgetPlaceFullscreen(entry.window.lock());
     const auto WINDOW  = entry.window.lock();
     const auto MONITOR = entry.monitor.lock();
     const bool FOCUSED = WINDOW && Desktop::focusState()->window() == WINDOW;
@@ -4184,6 +4187,7 @@ void canvasReclaimScreen(const PHLMONITOR& monitor) {
     Fullscreen::controller()->setFullscreenMode(WINDOW, Fullscreen::FSMODE_NONE, Fullscreen::FSMODE_NONE);
     g_canvasFullscreenApplying = false;
     canvasPlaceAfterFullscreen(ENTRY, canvas, WINDOW, monitor);
+    notePlaceFullscreen(WINDOW, g_canvasFullscreenReturn->modes);
 }
 
 static void canvasFullscreenReturnCheck() {
@@ -11270,6 +11274,7 @@ static bool tilingPlaces() {
 // again. Nothing moves while a button is down, so a window can be dragged
 // through places; once let go, one moved off its tile goes back or swaps.
 void CScrollOverview::reconcilePlaces() {
+    placeFullscreenCheck();
     if (closing || !isCanvasDesktop() || !tilingPlaces() || g_placeHeldButtons > 0 || g_pInputManager->hasHeldButtons())
         return;
     static Time::steady_tp lastRun;
@@ -11610,6 +11615,7 @@ bool CScrollOverview::canvasPlaceAction(const std::string& action) {
             canvas->canvasAdoptFocus(focusing);
         else
             Desktop::focusState()->fullWindowFocus(nullptr, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
+        expectPlaceFullscreen(place, TARGETMONITOR);
         canvas->damage();
         damage();
         return true;
@@ -12278,6 +12284,86 @@ bool CScrollOverview::placeClick(const Vector2D& world, const Vector2D& local) {
     placeState().cameras[place]  = Vector2D{std::round(CAMERA.x), std::round(CAMERA.y)};
     savePlaceState();
     return canvasPlaceAction("go " + std::to_string(place));
+}
+
+// ---- Fullscreen apps stay at their place -------------------------------------------
+// A place key on a screen a fullscreen app has to itself brings the canvas
+// back there: the app leaves fullscreen where it was, remembered as its
+// place's. Back at that place, at 100%, it is fullscreen again. Leaving
+// fullscreen yourself (Super+F) makes the place forget it.
+struct SPlaceFullscreen {
+    PHLWINDOWREF                window;
+    Fullscreen::SFullscreenMode modes;
+};
+static std::unordered_map<int, SPlaceFullscreen> g_placeFullscreen;
+static int                                       g_placeFullscreenPending = 0;
+
+static void notePlaceFullscreen(const PHLWINDOW& window, const Fullscreen::SFullscreenMode& modes) {
+    if (const int PLACE = screenPlaces() ? placeOfWindow(window) : 0; PLACE)
+        g_placeFullscreen[PLACE] = {.window = window, .modes = modes};
+}
+
+static void forgetPlaceFullscreen(const PHLWINDOW& window) {
+    std::erase_if(g_placeFullscreen, [&window](const auto& entry) { return !window || entry.second.window.lock() == window; });
+}
+
+void CScrollOverview::expectPlaceFullscreen(int place, const PHLMONITOR& monitor) {
+    g_placeFullscreenPending = 0;
+    const auto IT = g_placeFullscreen.find(place);
+    if (IT == g_placeFullscreen.end() || !monitor)
+        return;
+    const auto WINDOW = IT->second.window.lock();
+    if (!validMapped(WINDOW) || !placeWorldBox(place, monitor).containsPoint(placeWindowBox(WINDOW).middle())) {
+        g_placeFullscreen.erase(IT);
+        return;
+    }
+    g_placeFullscreenPending = place;
+}
+
+// Once the screen has arrived at the place, at 100%.
+void CScrollOverview::placeFullscreenCheck() {
+    if (!g_placeFullscreenPending)
+        return;
+    const int  PLACE   = g_placeFullscreenPending;
+    const auto MONITOR = placeMonitor(PLACE);
+    const auto IT      = g_placeFullscreen.find(PLACE);
+    const auto WINDOW  = IT != g_placeFullscreen.end() ? IT->second.window.lock() : nullptr;
+    auto*      canvas  = MONITOR ? canvasOf(scrollOverviewForMonitor(MONITOR)) : nullptr;
+    if (!canvas || !validMapped(WINDOW) || canvas->viewOffset->goal().distanceSq(placeCamera(PLACE)) > 1.0) {
+        g_placeFullscreenPending = 0;
+        return;
+    }
+    if (canvas->closing || canvas->isCanvasNavigationActive() || canvas->viewOffset->value().distanceSq(canvas->viewOffset->goal()) > 1.0)
+        return;
+    g_placeFullscreenPending = 0;
+    if (Fullscreen::controller()->isFullscreen(WINDOW))
+        return;
+    Desktop::focusState()->fullWindowFocus(WINDOW, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
+    Fullscreen::controller()->setFullscreenMode(WINDOW, IT->second.modes.internal, IT->second.modes.client);
+}
+
+// A place key while the focused screen's canvas stepped aside for a
+// fullscreen app (main.cpp). A place on another screen leaves the app alone.
+bool canvasPlaceKeyWhileFullscreen(const PHLMONITOR& focused, const std::string& action) {
+    if (!focused || !screenPlaces() || !canvasSteppedAside(focused))
+        return false;
+    if (action.starts_with("go ")) {
+        int place = 0;
+        try { place = std::stoi(action.substr(3)); } catch (...) { place = 0; }
+        if (const auto OWNER = place ? placeMonitor(place) : nullptr; OWNER && OWNER != focused) {
+            auto* canvas = canvasOf(scrollOverviewForMonitor(OWNER));
+            if (!canvas)
+                return false;
+            canvas->canvasPlaceAction(action);
+            Desktop::focusState()->rawMonitorFocus(OWNER);
+            Pointer::pointerController()->warpTo(OWNER->logicalBox().middle(), true);
+            return true;
+        }
+    }
+    if (!openCanvasOverview(focused))
+        return false;
+    auto* canvas = canvasOf(scrollOverviewForMonitor(focused));
+    return canvas && canvas->canvasPlaceAction(action);
 }
 
 // ---- Places on linked screens ------------------------------------------------------
