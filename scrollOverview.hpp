@@ -70,8 +70,14 @@ class CScrollOverview : public IOverview {
     bool         flightDeckAction(const std::string& action);
     bool         canvasPlaceAction(const std::string& action);
     bool         nudgeInPlace(PHLWINDOW window, const Vector2D& direction);
-    bool         placeClick(const Vector2D& world);
+    bool         placeClick(const Vector2D& world, const Vector2D& local);
     int          placeCloseAt(const Vector2D& local) const;
+    int          placeBadgeAt(const Vector2D& local) const;
+    bool         movePlace(int place, const PHLMONITOR& to);
+    void         openPlaceMenu(int place, const Vector2D& local);
+    bool         placeMenuOpen() const;
+    bool         placeMenuPress(const Vector2D& local, bool main);
+    void         renderPlaceMenu(PHLMONITOR monitor);
     std::optional<SPlaceChrome> placeChrome(int place, const PHLMONITOR& monitor) const;
     void         reconcilePlaces();
     void         renderPlaceOutlines(PHLMONITOR monitor);
