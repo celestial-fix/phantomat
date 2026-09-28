@@ -2367,6 +2367,11 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
         } else if (event.state == WL_KEYBOARD_KEY_STATE_PRESSED)
             SpatialOverview::Navigator::takeConsumed(event.keycode); // a fresh press means its old release was lost
 
+        if (!closing && isCanvasDesktop() && placeMenuKey(event, KEYSYM, g_pInputManager->getModsFromAllKBs() & ~(HL_MODIFIER_CAPS | HL_MODIFIER_MOD2))) {
+            info.cancelled = true;
+            return;
+        }
+
         if (closing || activeScrollOverview().get() != this)
             return;
 
@@ -11024,6 +11029,7 @@ struct SPlaceState {
     std::map<int, std::string> monitors;
     std::map<int, Vector2D>    cameras;
     std::map<int, bool>        tiling; // " tiled" / " free" at the end of the line: wins over canvas:tile_places
+    std::map<int, std::string> names;  // " #name", last on the line
 };
 
 static SPlaceState& placeState() {
@@ -11033,6 +11039,11 @@ static SPlaceState& placeState() {
         std::ifstream in{placeMonitorsPath()};
         std::string   line;
         while (std::getline(in, line)) {
+            std::string name;
+            if (const auto HASH = line.find(" #"); HASH != std::string::npos) {
+                name = line.substr(HASH + 2);
+                line.resize(HASH);
+            }
             const auto AT = std::min(line.find('@'), line.find(' '));
             for (const auto& [place, name] : parsePlaceMonitors(line.substr(0, AT))) {
                 state->monitors[place] = name;
@@ -11041,6 +11052,8 @@ static SPlaceState& placeState() {
                     state->cameras[place] = Vector2D{x, y};
                 if (line.ends_with(" free") || line.ends_with(" tiled"))
                     state->tiling[place] = line.ends_with(" tiled");
+                if (!name.empty())
+                    state->names[place] = name;
             }
         }
     }
@@ -11059,8 +11072,34 @@ static void savePlaceState() {
             out << '@' << sc<long>(std::lround(IT->second.x)) << ',' << sc<long>(std::lround(IT->second.y));
         if (const auto IT = STATE.tiling.find(number); IT != STATE.tiling.end())
             out << (IT->second ? " tiled" : " free");
+        if (const auto IT = STATE.names.find(number); IT != STATE.names.end() && !IT->second.empty())
+            out << " #" << IT->second;
         out << '\n';
     }
+}
+
+static std::string placeName(int place) {
+    const auto IT = placeState().names.find(place);
+    return IT == placeState().names.end() ? std::string{} : IT->second;
+}
+
+// "Space 3", or "Space 3 · mail" once it has a name.
+static std::string placeLabel(int place) {
+    const auto NAME = placeName(place);
+    return "Space " + std::to_string(place) + (NAME.empty() ? "" : "  ·  " + NAME);
+}
+
+static void setPlaceName(int place, std::string name) {
+    std::erase_if(name, [](unsigned char c) { return c < 0x20 || c == 0x7F; });
+    while (!name.empty() && name.back() == ' ')
+        name.pop_back();
+    while (!name.empty() && name.front() == ' ')
+        name.erase(name.begin());
+    if (name.empty())
+        placeState().names.erase(place);
+    else
+        placeState().names[place] = name;
+    savePlaceState();
 }
 
 static std::map<int, std::string>& assignedPlaceMonitors() {
@@ -11447,6 +11486,24 @@ struct SPlaceChrome {
     CBox inner, badge, close;
 };
 
+// Pixel width of `text` drawn at `points`.
+static float canvasTextWidth(const std::string& text, int points) {
+    static std::unordered_map<std::string, float> widths;
+    const auto KEY = std::to_string(points) + '\n' + text;
+    if (const auto IT = widths.find(KEY); IT != widths.end())
+        return IT->second;
+    const auto  TEXTURE = g_pHyprRenderer->renderText(text, CHyprColor{1.F, 1.F, 1.F, 1.F}, std::max(points, 1));
+    const float WIDTH   = TEXTURE && TEXTURE->ok() ? sc<float>(TEXTURE->m_size.x) : sc<float>(text.size()) * points * 0.6F;
+    if (widths.size() > 256)
+        widths.clear();
+    return widths[KEY] = WIDTH;
+}
+
+static std::string placeBadgeText(int place) {
+    const auto NAME = placeName(place);
+    return NAME.empty() ? std::to_string(place) : std::to_string(place) + "  " + NAME;
+}
+
 std::optional<SPlaceChrome> CScrollOverview::placeChrome(int place, const PHLMONITOR& monitor) const {
     const auto OWNER = placeMonitor(place);
     if (!OWNER || !monitor)
@@ -11455,7 +11512,11 @@ std::optional<SPlaceChrome> CScrollOverview::placeChrome(int place, const PHLMON
     const auto  SCREEN = canvasWorldToScreen(placeWorldBox(place, OWNER));
     const CBox  INNER  = CBox{(SCREEN.pos() - monitor->m_position) * SCALE, SCREEN.size() * SCALE}.round();
     const float BADGE  = 40.F * SCALE;
-    const CBox  NUMBER = CBox{INNER.x + 14.F * SCALE, INNER.y + 14.F * SCALE, place == 10 ? BADGE * 1.4F : BADGE, BADGE}.round();
+    float       width  = place == 10 ? BADGE * 1.4F : BADGE;
+    if (!placeName(place).empty())
+        width = std::clamp(canvasTextWidth(placeBadgeText(place), sc<int>(std::round(20.F * SCALE))) + 26.F * SCALE, width,
+                           std::max(width, sc<float>(INNER.width) - BADGE - 36.F * SCALE));
+    const CBox NUMBER = CBox{INNER.x + 14.F * SCALE, INNER.y + 14.F * SCALE, width, BADGE}.round();
     return SPlaceChrome{INNER, NUMBER, CBox{NUMBER.x + NUMBER.width + 8.F * SCALE, NUMBER.y, BADGE, BADGE}.round()};
 }
 
@@ -11483,6 +11544,8 @@ int CScrollOverview::placeBadgeAt(const Vector2D& local) const {
 static void removePlace(int place) {
     placeState().monitors.erase(place);
     placeState().cameras.erase(place);
+    placeState().tiling.erase(place);
+    placeState().names.erase(place);
     savePlaceState();
     g_places.erase(place);
     g_placeOrder.erase(place);
@@ -11525,7 +11588,7 @@ void CScrollOverview::renderPlaceOutlines(PHLMONITOR monitor) {
         badge.round         = sc<int>(std::round(9.F * SCALE));
         badge.roundingPower = 2.F;
         g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(badge));
-        drawCanvasText(std::to_string(place), CBox{badge.box.x + 12.F * SCALE, badge.box.y + 5.F * SCALE, badge.box.width, badge.box.height},
+        drawCanvasText(placeBadgeText(place), CBox{badge.box.x + 12.F * SCALE, badge.box.y + 5.F * SCALE, badge.box.width - 18.F * SCALE, badge.box.height},
                        CHyprColor{0.04F, 0.04F, 0.05F, FADE}, sc<int>(std::round(20.F * SCALE)));
 
         CRectPassElement::SRectData close;
@@ -11655,7 +11718,7 @@ bool CScrollOverview::canvasPlaceAction(const std::string& action) {
             return true;
         if (!canvasNavigationActive)
             toggleCanvasNavigation();
-        openPlaceMenu(place, MONITOR->m_size * MONITOR->m_scale / 2.0 - Vector2D{140.0, 120.0} * MONITOR->m_scale);
+        openPlaceMenu(place, MONITOR->m_size * MONITOR->m_scale / 2.0 - Vector2D{140.0, 120.0} * MONITOR->m_scale, true);
         return true;
     }
 
@@ -11803,6 +11866,20 @@ static void renumberPlace(int from, int to) {
         STATE.monitors.erase(from);
         STATE.cameras.erase(from);
     }
+    const auto swapEntries = [from, to](auto& map) {
+        auto fromEntry = map.extract(from);
+        auto toEntry   = map.extract(to);
+        if (fromEntry) {
+            fromEntry.key() = to;
+            map.insert(std::move(fromEntry));
+        }
+        if (toEntry) {
+            toEntry.key() = from;
+            map.insert(std::move(toEntry));
+        }
+    };
+    swapEntries(STATE.tiling);
+    swapEntries(STATE.names);
     savePlaceState();
     std::swap(g_places[from], g_places[to]);
     std::swap(g_placeOrder[from], g_placeOrder[to]);
@@ -11816,7 +11893,10 @@ struct SPlaceMenu {
     PHLWINDOWREF  window;    // set: the menu of a window
     PHLMONITORREF monitor;
     Vector2D      anchor; // monitor-local pixels
-    int           page = 0; // place: 0 actions, 1 numbers, 2 screens; window: 10 actions, 11 spaces, 12 screens
+    int           page = 0; // place: 0 actions, 1 numbers, 2 screens, 3 name; window: 10 actions, 11 spaces, 12 screens
+    int           selected = -1; // the item the keys are on
+    Vector2D      keyPointer;    // where the pointer was at the last key: once it moves, it points again
+    std::string   draft;         // the name being typed
 };
 static SPlaceMenu g_placeMenu;
 
@@ -11826,6 +11906,10 @@ enum ePlaceMenuItem : uint8_t {
     PLACE_MENU_SCREENS,
     PLACE_MENU_DELETE,
     PLACE_MENU_TILING,
+    PLACE_MENU_RENAME,
+    PLACE_MENU_BRING,
+    PLACE_MENU_NAME_SAVE,
+    PLACE_MENU_NAME_CLEAR,
     WINDOW_MENU_FLOAT,
     PLACE_MENU_BACK,
     PLACE_MENU_NUMBER,
@@ -11859,8 +11943,28 @@ struct SPlaceMenuItem {
 struct SPlaceMenuLayout {
     CBox                        frame;
     std::string                 title;
+    std::optional<CBox>         field; // the name being typed, on the name page
     std::vector<SPlaceMenuItem> items;
 };
+
+static std::string menuWindowTitle(const PHLWINDOW& window, size_t length) {
+    auto title = window->m_title.empty() ? window->m_class : window->m_title;
+    if (title.size() > length) {
+        size_t cut = length - 1;
+        while (cut > 0 && (sc<unsigned char>(title[cut]) & 0xC0) == 0x80)
+            --cut;
+        title = title.substr(0, cut) + "…";
+    }
+    return title;
+}
+
+// The focused window, when it can be brought to `place` from elsewhere.
+static PHLWINDOW placeBringable(int place) {
+    const auto WINDOW = getOverviewWindowToShow(Desktop::focusState()->window());
+    if (!WINDOW || !shouldShowOverviewWindow(WINDOW) || WINDOW->m_pinned || placeOfWindow(WINDOW) == place)
+        return nullptr;
+    return WINDOW;
+}
 
 static std::optional<SPlaceMenuLayout> placeMenuLayout(const PHLMONITOR& monitor) {
     if (!monitor || g_placeMenu.monitor.lock() != monitor)
@@ -11875,12 +11979,12 @@ static std::optional<SPlaceMenuLayout> placeMenuLayout(const PHLMONITOR& monitor
     const float      SCALE = std::max(monitor->m_scale, 0.01F);
     const float      WIDTH = 280.F * SCALE, ROW = 44.F * SCALE, PAD = 8.F * SCALE, TITLE = 40.F * SCALE;
     SPlaceMenuLayout layout;
-    if (FORWINDOW) {
-        layout.title = WINDOW->m_title.empty() ? WINDOW->m_class : WINDOW->m_title;
-        if (layout.title.size() > 30)
-            layout.title = layout.title.substr(0, 29) + "…";
-    } else
-        layout.title = "Space " + std::to_string(g_placeMenu.place) + "  ·  " + OWNER->m_name;
+    if (FORWINDOW)
+        layout.title = menuWindowTitle(WINDOW, 30);
+    else if (g_placeMenu.page == 3)
+        layout.title = "Name space " + std::to_string(g_placeMenu.place);
+    else
+        layout.title = placeLabel(g_placeMenu.place) + "  ·  " + OWNER->m_name;
     std::vector<SPlaceMenuItem> rows;
     if (g_placeMenu.page == 10) {
         rows.push_back({.label = "Send to space  ›", .kind = WINDOW_MENU_SPACES});
@@ -11889,7 +11993,7 @@ static std::optional<SPlaceMenuLayout> placeMenuLayout(const PHLMONITOR& monitor
         if (OWNER && placeTiling(g_placeMenu.place))
             rows.push_back({.label = g_placeFloating.contains(WINDOW.get()) ? "Tile window" : "Float window", .kind = WINDOW_MENU_FLOAT});
         if (OWNER)
-            rows.push_back({.label = "Space " + std::to_string(g_placeMenu.place) + "  ›", .kind = WINDOW_MENU_PLACE});
+            rows.push_back({.label = placeLabel(g_placeMenu.place) + "  ›", .kind = WINDOW_MENU_PLACE});
     } else if (g_placeMenu.page == 12) {
         rows.push_back({.label = "‹  Back", .kind = PLACE_MENU_BACK});
         const auto HERE = OWNER ? OWNER : WINDOW->m_monitor.lock();
@@ -11899,6 +12003,9 @@ static std::optional<SPlaceMenuLayout> placeMenuLayout(const PHLMONITOR& monitor
                                 .kind  = WINDOW_MENU_SEND_SCREEN, .screen = screen, .current = screen == HERE});
     } else if (g_placeMenu.page == 0) {
         rows.push_back({.label = "Go to space", .kind = PLACE_MENU_GO});
+        if (const auto BRING = placeBringable(g_placeMenu.place))
+            rows.push_back({.label = "Bring here: " + menuWindowTitle(BRING, 18), .kind = PLACE_MENU_BRING});
+        rows.push_back({.label = placeName(g_placeMenu.place).empty() ? "Name…" : "Rename…", .kind = PLACE_MENU_RENAME});
         rows.push_back({.label = "Change number  ›", .kind = PLACE_MENU_NUMBERS});
         if (State::monitorState()->monitors().size() > 1)
             rows.push_back({.label = "Move to screen  ›", .kind = PLACE_MENU_SCREENS});
@@ -11910,19 +12017,29 @@ static std::optional<SPlaceMenuLayout> placeMenuLayout(const PHLMONITOR& monitor
             if (screen && screen->m_enabled)
                 rows.push_back({.label = screen->m_name + "  " + std::to_string(sc<int>(screen->m_size.x)) + "×" + std::to_string(sc<int>(screen->m_size.y)),
                                 .kind  = PLACE_MENU_SCREEN, .screen = screen, .current = screen == OWNER});
+    } else if (g_placeMenu.page == 3) {
+        rows.push_back({.label = "Save  (Enter)", .kind = PLACE_MENU_NAME_SAVE});
+        if (!placeName(g_placeMenu.place).empty())
+            rows.push_back({.label = "Remove name", .kind = PLACE_MENU_NAME_CLEAR});
+        rows.push_back({.label = "‹  Back", .kind = PLACE_MENU_BACK});
     } else
         rows.push_back({.label = "‹  Back", .kind = PLACE_MENU_BACK});
 
     // Numbers: a 5 × 2 grid under the back row; taken ones swap.
     const bool  GRID     = g_placeMenu.page == 1 || g_placeMenu.page == 11;
     const float GRIDROWS = GRID ? 2.F : 0.F;
-    const float HEIGHT   = TITLE + rows.size() * ROW + GRIDROWS * ROW + PAD * 2.F;
+    const float FIELD    = g_placeMenu.page == 3 ? ROW + PAD : 0.F;
+    const float HEIGHT   = TITLE + FIELD + rows.size() * ROW + GRIDROWS * ROW + PAD * 2.F;
     Vector2D    pos      = g_placeMenu.anchor;
     pos.x                = std::clamp(pos.x, 0.0, std::max(0.0, monitor->m_size.x * SCALE - WIDTH));
     pos.y                = std::clamp(pos.y, 0.0, std::max(0.0, monitor->m_size.y * SCALE - HEIGHT));
     layout.frame         = CBox{pos, {WIDTH, HEIGHT}}.round();
 
     float y = layout.frame.y + PAD + TITLE;
+    if (FIELD > 0.F) {
+        layout.field = CBox{layout.frame.x + PAD, y, WIDTH - PAD * 2.F, ROW}.round();
+        y += FIELD;
+    }
     for (auto& row : rows) {
         row.box = CBox{layout.frame.x + PAD, y, WIDTH - PAD * 2.F, ROW}.round();
         y += ROW;
@@ -11942,8 +12059,8 @@ static std::optional<SPlaceMenuLayout> placeMenuLayout(const PHLMONITOR& monitor
     return layout;
 }
 
-void CScrollOverview::openPlaceMenu(int place, const Vector2D& local) {
-    g_placeMenu = SPlaceMenu{.place = place, .monitor = pMonitor, .anchor = local, .page = 0};
+void CScrollOverview::openPlaceMenu(int place, const Vector2D& local, bool keys) {
+    g_placeMenu = SPlaceMenu{.place = place, .monitor = pMonitor, .anchor = local, .page = 0, .selected = keys ? 0 : -1, .keyPointer = lastMousePosLocal};
     damage();
 }
 
@@ -12027,51 +12144,212 @@ bool CScrollOverview::placeMenuPress(const Vector2D& local, bool main) {
     }
     if (!main)
         return true;
+    for (const auto& item : LAYOUT->items)
+        if (item.box.containsPoint(local)) {
+            activatePlaceMenuItem(item, false);
+            break;
+        }
+    damage();
+    return true;
+}
+
+// A page the keys opened starts on its first item; one the pointer opened, on none.
+void CScrollOverview::activatePlaceMenuItem(const SPlaceMenuItem& item, bool keys) {
     const int  PLACE  = g_placeMenu.place;
     const auto WINDOW = g_placeMenu.window.lock();
-    for (const auto& item : LAYOUT->items) {
-        if (!item.box.containsPoint(local))
-            continue;
-        switch (item.kind) {
-            case PLACE_MENU_NUMBERS: g_placeMenu.page = 1; break;
-            case PLACE_MENU_SCREENS: g_placeMenu.page = 2; break;
-            case PLACE_MENU_BACK: g_placeMenu.page = g_placeMenu.page >= 10 ? 10 : 0; break;
-            case PLACE_MENU_TILING: setPlaceTiling(PLACE, !placeTiling(PLACE)); break;
-            case WINDOW_MENU_FLOAT:
-                g_placeMenu = {};
-                canvasToggleTiled(WINDOW);
-                break;
-            case WINDOW_MENU_SPACES: g_placeMenu.page = 11; break;
-            case WINDOW_MENU_SCREENS: g_placeMenu.page = 12; break;
-            case WINDOW_MENU_PLACE: g_placeMenu.page = 0; break;
-            case WINDOW_MENU_SEND_PLACE:
-                g_placeMenu = {};
-                sendWindowTo(WINDOW, item.number, nullptr);
-                break;
-            case WINDOW_MENU_SEND_SCREEN:
-                g_placeMenu = {};
-                sendWindowTo(WINDOW, 0, item.screen);
-                break;
-            case PLACE_MENU_GO:
-                g_placeMenu = {};
-                canvasPlaceAction("go " + std::to_string(PLACE));
-                break;
-            case PLACE_MENU_DELETE:
-                g_placeMenu = {};
-                removePlace(PLACE);
-                break;
-            case PLACE_MENU_NUMBER:
-                g_placeMenu = {};
-                renumberPlace(PLACE, item.number);
-                break;
-            case PLACE_MENU_SCREEN:
-                g_placeMenu = {};
-                movePlace(PLACE, item.screen);
-                break;
-        }
-        break;
+    const auto page   = [keys](int page) {
+        g_placeMenu.page     = page;
+        g_placeMenu.selected = keys ? 0 : -1;
+    };
+    switch (item.kind) {
+        case PLACE_MENU_NUMBERS: page(1); break;
+        case PLACE_MENU_SCREENS: page(2); break;
+        case PLACE_MENU_RENAME:
+            g_placeMenu.draft = placeName(PLACE);
+            page(3);
+            g_placeMenu.selected = -1;
+            break;
+        case PLACE_MENU_BACK: page(g_placeMenu.page >= 10 ? 10 : 0); break;
+        case PLACE_MENU_TILING: setPlaceTiling(PLACE, !placeTiling(PLACE)); break;
+        case PLACE_MENU_NAME_SAVE:
+            setPlaceName(PLACE, g_placeMenu.draft);
+            page(0);
+            break;
+        case PLACE_MENU_NAME_CLEAR:
+            setPlaceName(PLACE, "");
+            page(0);
+            break;
+        case PLACE_MENU_BRING:
+            g_placeMenu = {};
+            if (const auto BRING = placeBringable(PLACE))
+                sendWindowTo(BRING, PLACE, nullptr);
+            break;
+        case WINDOW_MENU_FLOAT:
+            g_placeMenu = {};
+            canvasToggleTiled(WINDOW);
+            break;
+        case WINDOW_MENU_SPACES: page(11); break;
+        case WINDOW_MENU_SCREENS: page(12); break;
+        case WINDOW_MENU_PLACE: page(0); break;
+        case WINDOW_MENU_SEND_PLACE:
+            g_placeMenu = {};
+            sendWindowTo(WINDOW, item.number, nullptr);
+            break;
+        case WINDOW_MENU_SEND_SCREEN:
+            g_placeMenu = {};
+            sendWindowTo(WINDOW, 0, item.screen);
+            break;
+        case PLACE_MENU_GO:
+            g_placeMenu = {};
+            canvasPlaceAction("go " + std::to_string(PLACE));
+            break;
+        case PLACE_MENU_DELETE:
+            g_placeMenu = {};
+            removePlace(PLACE);
+            break;
+        case PLACE_MENU_NUMBER:
+            g_placeMenu = {};
+            renumberPlace(PLACE, item.number);
+            break;
+        case PLACE_MENU_SCREEN:
+            g_placeMenu = {};
+            movePlace(PLACE, item.screen);
+            break;
     }
-    damage();
+    for (const auto& overview : scrollOverviews())
+        overview->damage();
+}
+
+// While a place menu is open its keys are its own (SUPER chords still reach
+// Hyprland): arrows or Tab pick, Enter runs, Left or Backspace go back a
+// page, Esc closes; on a number grid a digit picks that number, and on the
+// name page typing writes the name.
+bool CScrollOverview::placeMenuKey(const IKeyboard::SKeyEvent& event, uint32_t keysym, uint32_t mods) {
+    if (event.state != WL_KEYBOARD_KEY_STATE_PRESSED || !placeMenuOpen() || isModifierKeysym(keysym) || (mods & HL_MODIFIER_META))
+        return false;
+    const auto LAYOUT = placeMenuLayout(pMonitor.lock());
+    if (!LAYOUT) {
+        g_placeMenu = {};
+        return false;
+    }
+    const auto& ITEMS  = LAYOUT->items;
+    const int   COUNT  = sc<int>(ITEMS.size());
+    const bool  NAMING = g_placeMenu.page == 3;
+    const bool  CTRL   = mods & HL_MODIFIER_CTRL;
+    const auto  isCell = [&](int index) { return index >= 0 && index < COUNT && ITEMS[index].number > 0; };
+    const int   ROWS   = sc<int>(std::ranges::count_if(ITEMS, [](const SPlaceMenuItem& item) { return item.number == 0; }));
+    auto&       selected = g_placeMenu.selected;
+    selected             = std::clamp(selected, -1, COUNT - 1);
+    g_placeMenu.keyPointer = lastMousePosLocal;
+
+    const auto back = [&] {
+        if (g_placeMenu.page == 0 || g_placeMenu.page == 10) {
+            if (g_placeMenu.page == 0 && !g_placeMenu.window.expired()) {
+                g_placeMenu.page = 10;
+                selected         = 0;
+            } else
+                g_placeMenu = {};
+        } else {
+            g_placeMenu.page = g_placeMenu.page >= 10 ? 10 : 0;
+            selected         = 0;
+        }
+    };
+    // Rows step one by one; on the grid, up and down go a row of five.
+    const auto step = [&](int delta, bool vertical) {
+        if (COUNT == 0)
+            return;
+        if (selected < 0)
+            selected = delta > 0 ? 0 : COUNT - 1;
+        else if (vertical && isCell(selected)) {
+            const int NEXT = selected - ROWS + delta * 5;
+            if (NEXT < 0)
+                selected = ROWS > 0 ? ROWS - 1 : selected;
+            else if (NEXT < COUNT - ROWS)
+                selected = ROWS + NEXT;
+        } else
+            selected = (selected + delta + COUNT) % COUNT;
+    };
+    const auto run = [&](int index) {
+        if (index >= 0 && index < COUNT) {
+            const auto ITEM = ITEMS[index];
+            activatePlaceMenuItem(ITEM, true);
+        }
+    };
+
+    switch (keysym) {
+        case XKB_KEY_Escape:
+            if (g_placeMenu.page == 0 || g_placeMenu.page == 10)
+                g_placeMenu = {};
+            else
+                back();
+            break;
+        case XKB_KEY_Up:
+        case XKB_KEY_KP_Up: step(-1, true); break;
+        case XKB_KEY_Down:
+        case XKB_KEY_KP_Down: step(1, true); break;
+        case XKB_KEY_Tab: step((mods & HL_MODIFIER_SHIFT) ? -1 : 1, false); break;
+        case XKB_KEY_ISO_Left_Tab: step(-1, false); break;
+        case XKB_KEY_Left:
+        case XKB_KEY_KP_Left:
+            if (isCell(selected) && (selected - ROWS) % 5 != 0)
+                --selected;
+            else if (!NAMING)
+                back();
+            break;
+        case XKB_KEY_Right:
+        case XKB_KEY_KP_Right:
+            if (isCell(selected) && (selected - ROWS) % 5 != 4 && selected + 1 < COUNT)
+                ++selected;
+            else if (selected >= 0 &&
+                     std::ranges::contains(std::array{PLACE_MENU_NUMBERS, PLACE_MENU_SCREENS, PLACE_MENU_RENAME, WINDOW_MENU_SPACES, WINDOW_MENU_SCREENS, WINDOW_MENU_PLACE},
+                                           ITEMS[selected].kind))
+                run(selected);
+            break;
+        case XKB_KEY_Return:
+        case XKB_KEY_KP_Enter:
+            if (NAMING && selected < 0) {
+                setPlaceName(g_placeMenu.place, g_placeMenu.draft);
+                g_placeMenu.page     = 0;
+                selected             = 0;
+            } else
+                run(selected);
+            break;
+        case XKB_KEY_BackSpace:
+            if (!NAMING)
+                back();
+            else if (CTRL)
+                g_placeMenu.draft.clear();
+            else if (!g_placeMenu.draft.empty()) {
+                auto& draft = g_placeMenu.draft;
+                size_t cut = draft.size() - 1;
+                while (cut > 0 && (sc<unsigned char>(draft[cut]) & 0xC0) == 0x80)
+                    --cut;
+                draft.resize(cut);
+            }
+            break;
+        default: {
+            if (NAMING) {
+                if (CTRL && (keysym == XKB_KEY_u || keysym == XKB_KEY_U || keysym == XKB_KEY_w || keysym == XKB_KEY_W))
+                    g_placeMenu.draft.clear();
+                else if (const auto TEXT = CTRL || (mods & HL_MODIFIER_ALT) ? std::string{} : navigatorKeyText(event);
+                         !TEXT.empty() && std::ranges::none_of(TEXT, [](unsigned char c) { return c < 0x20 || c == 0x7F; }) && g_placeMenu.draft.size() + TEXT.size() <= 48) {
+                    g_placeMenu.draft += TEXT;
+                    selected = -1;
+                }
+            } else if (keysym >= XKB_KEY_0 && keysym <= XKB_KEY_9 && ROWS < COUNT) {
+                const int NUMBER = keysym == XKB_KEY_0 ? 10 : sc<int>(keysym - XKB_KEY_0);
+                for (int index = ROWS; index < COUNT; ++index)
+                    if (ITEMS[index].number == NUMBER) {
+                        run(index);
+                        break;
+                    }
+            }
+            break;
+        }
+    }
+    SpatialOverview::Navigator::markConsumed(event.keycode);
+    for (const auto& overview : scrollOverviews())
+        overview->damage();
     return true;
 }
 
@@ -12106,9 +12384,24 @@ void CScrollOverview::renderPlaceMenu(PHLMONITOR monitor) {
     drawCanvasText(LAYOUT->title, CBox{LAYOUT->frame.x + 18.F * SCALE, LAYOUT->frame.y + 16.F * SCALE, LAYOUT->frame.width - 36.F * SCALE, 24.F * SCALE}, dim,
                    sc<int>(std::round(13.F * SCALE)));
 
-    for (const auto& item : LAYOUT->items) {
-        const bool HOVER  = item.box.containsPoint(lastMousePosLocal);
-        const bool DANGER = item.kind == PLACE_MENU_DELETE;
+    if (LAYOUT->field) {
+        CRectPassElement::SRectData field;
+        field.box           = *LAYOUT->field;
+        field.color         = CHyprColor{1.F, 1.F, 1.F, 0.08F};
+        field.round         = sc<int>(std::round(7.F * SCALE));
+        field.roundingPower = 2.F;
+        g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(field));
+        const bool EMPTY = g_placeMenu.draft.empty();
+        drawCanvasText(EMPTY ? "Type a name" : g_placeMenu.draft + "▏", CBox{field.box.x + 14.F * SCALE, field.box.y + 11.F * SCALE, field.box.width - 28.F * SCALE, field.box.height - 11.F * SCALE},
+                       EMPTY ? dim : THEME.text, sc<int>(std::round(15.F * SCALE)));
+    }
+
+    // The keys' pick shows until the pointer moves; then what it is over does.
+    const bool KEYS = g_placeMenu.selected >= 0 && lastMousePosLocal == g_placeMenu.keyPointer;
+    for (size_t index = 0; index < LAYOUT->items.size(); ++index) {
+        const auto& item   = LAYOUT->items[index];
+        const bool  HOVER  = KEYS ? sc<int>(index) == g_placeMenu.selected : item.box.containsPoint(lastMousePosLocal);
+        const bool  DANGER = item.kind == PLACE_MENU_DELETE;
         const bool CELL   = item.kind == PLACE_MENU_NUMBER;
         if (HOVER || (CELL && item.number == g_placeMenu.place)) {
             CRectPassElement::SRectData highlight;

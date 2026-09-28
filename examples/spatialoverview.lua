@@ -268,6 +268,11 @@ bind("SUPER + T", "Float in place / fill screen (canvas) / toggle floating", can
   hl.dsp.window.float({ action = "toggle" }),
 }))
 
+-- On the canvas, SUPER + M opens the menu of the place this screen shows
+-- (arrows pick, Enter runs, Esc closes).
+hl.unbind("SUPER + M")
+bind("SUPER + M", "Place menu (canvas)", canvas_or("menu", {}))
+
 -- Keys that tile, group, pop windows out or move workspaces between monitors
 -- mean something else on the canvas, where every window floats and the
 -- screens are one desk: SUPER + O pins the window where it is on the screen
