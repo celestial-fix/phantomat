@@ -260,11 +260,11 @@ for _, move in ipairs({
   }), { repeating = true })
 end
 
--- On the canvas floating/tiling means nothing, so SUPER + T makes the focused
--- window fill the screen it is on instead; again puts it back. Tiled
--- desktops toggle floating.
+-- On the canvas, SUPER + T floats the focused window out of a tiled place
+-- (or tiles it again); outside one it fills the screen it is on, and again
+-- puts it back. Tiled desktops toggle floating.
 hl.unbind("SUPER + T")
-bind("SUPER + T", "Fill screen (canvas) / toggle floating", canvas_or("fill", {
+bind("SUPER + T", "Float in place / fill screen (canvas) / toggle floating", canvas_or("float", {
   hl.dsp.window.float({ action = "toggle" }),
 }))
 
