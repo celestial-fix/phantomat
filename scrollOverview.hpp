@@ -25,6 +25,7 @@
 class CMonitor;
 struct wl_event_source;
 struct SPlaceChrome;
+struct SPlaceMenuItem;
 
 class CScrollOverview : public IOverview {
   public:
@@ -85,9 +86,11 @@ class CScrollOverview : public IOverview {
     bool         sendWindowTo(PHLWINDOW window, int place, PHLMONITOR screen);
     bool         placeRightRelease(const Vector2D& local, bool resized);
     bool         movePlace(int place, const PHLMONITOR& to);
-    void         openPlaceMenu(int place, const Vector2D& local);
+    void         openPlaceMenu(int place, const Vector2D& local, bool keys = false);
     bool         placeMenuOpen() const;
     bool         placeMenuPress(const Vector2D& local, bool main);
+    void         activatePlaceMenuItem(const SPlaceMenuItem& item, bool keys);
+    bool         placeMenuKey(const IKeyboard::SKeyEvent& event, uint32_t keysym, uint32_t mods);
     void         renderPlaceMenu(PHLMONITOR monitor);
     std::optional<SPlaceChrome> placeChrome(int place, const PHLMONITOR& monitor) const;
     void         reconcilePlaces();
