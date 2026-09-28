@@ -122,6 +122,7 @@ static int g_userFollowMouse = 1; // input:follow_mouse as set before the canvas
 static void notePlaceWindow(const PHLWINDOW& window, bool opened);
 static int  placeAt(const PHLMONITOR& monitor, const Vector2D& world);
 static void removePlace(int place);
+static bool canvasSnapDoubleClick(const PHLWINDOW& window, uint32_t timeMs);
 // Going to a place at 100% shows the minimap for a moment (see canvasPlaceAction).
 static Time::steady_tp g_minimapFlashStart, g_minimapFlashUntil;
 static float minimapFlashAlpha(const Time::steady_tp& now) {
@@ -1583,6 +1584,11 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
         const float    DRAGTHRESHOLDSQ       = std::pow(DRAGTHRESHOLD, 2);
 
         lastMousePosLocal = getOverviewMousePosLocal(pMonitor.lock());
+        if (placeDragMotion(lastMousePosLocal)) {
+            info.cancelled = true;
+            requestInputFrame();
+            return;
+        }
         if (landingDrag) {
             info.cancelled = true;
             updateExperimentDrag();
@@ -1797,6 +1803,22 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
                 return;
             }
 
+            if (event.state == WL_POINTER_BUTTON_STATE_RELEASED && event.button == MAIN && placeDragRelease()) {
+                info.cancelled = true;
+                requestInputFrame();
+                return;
+            }
+            if (event.state == WL_POINTER_BUTTON_STATE_RELEASED && event.button == (LEFT_HANDED ? BTN_LEFT : BTN_RIGHT) &&
+                placeRightRelease(lastMousePosLocal, !resizeActiveWindow.expired())) {
+                info.cancelled           = true;
+                resizePointerDown        = false;
+                submapMouseClickPending  = false;
+                submapMouseClickButton   = 0;
+                resizePendingWindow.reset();
+                requestInputFrame();
+                return;
+            }
+
             if (event.state == WL_POINTER_BUTTON_STATE_RELEASED && navigatorSwallowedButtons.erase(event.button)) {
                 info.cancelled = true;
                 return;
@@ -1822,12 +1844,26 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
                 return;
             }
 
+            if (event.button == MAIN && event.state == WL_POINTER_BUTTON_STATE_PRESSED && (MODS & HL_MODIFIER_META) && !clientGestureButton &&
+                canvasSnapDoubleClick(windowAtOverviewCursor(), event.timeMs)) {
+                info.cancelled = true;
+                navigatorSwallowedButtons.emplace(event.button);
+                requestInputFrame();
+                return;
+            }
+
             if (event.button == MAIN && event.state == WL_POINTER_BUTTON_STATE_PRESSED && !clientGestureButton) {
                 if (const int PLACE = placeCloseAt(lastMousePosLocal); PLACE) {
                     info.cancelled = true;
                     navigatorSwallowedButtons.emplace(event.button);
                     removePlace(PLACE);
                     damage();
+                    requestInputFrame();
+                    return;
+                }
+                if (placeDragPress(lastMousePosLocal)) {
+                    info.cancelled        = true;
+                    g_pointerGrabOverview = this;
                     requestInputFrame();
                     return;
                 }
@@ -1840,7 +1876,12 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
                 const auto WORLD = canvasScreenToWorld(CBox{MONITOR->m_position + lastMousePosLocal / MONITOR->m_scale, {}}, false);
                 if (BADGE)
                     openPlaceMenu(BADGE, lastMousePosLocal);
-                if (BADGE || (WORLD && !windowAtOverviewCursor() && placeClick(WORLD->pos(), lastMousePosLocal))) {
+                // On a window, a click (no drag) opens the menu on release;
+                // a drag still resizes.
+                const bool ONWINDOW = !BADGE && windowAtOverviewCursor();
+                if (ONWINDOW && WORLD && navigatorOwnsPointer())
+                    placeRightPress(WORLD->pos(), lastMousePosLocal);
+                if (BADGE || (WORLD && !ONWINDOW && placeClick(WORLD->pos(), lastMousePosLocal))) {
                     info.cancelled = true;
                     navigatorSwallowedButtons.emplace(event.button);
                     requestInputFrame();
@@ -11280,6 +11321,21 @@ bool canvasToggleTiled(PHLWINDOW window) {
     return false;
 }
 
+// SUPER + double-click on a window floating in a tiled place snaps it back
+// into the tiling, at the tile under it.
+static bool canvasSnapDoubleClick(const PHLWINDOW& clicked, uint32_t timeMs) {
+    static PHLWINDOWREF lastWindow;
+    static uint32_t     lastTime = 0;
+    const auto          WINDOW   = getOverviewWindowToShow(clicked);
+    const bool          DOUBLE   = WINDOW && lastWindow.lock() == WINDOW && timeMs - lastTime < 400;
+    lastWindow                   = WINDOW;
+    lastTime                     = timeMs;
+    if (!DOUBLE || !tilingPlaces() || !g_placeFloating.contains(WINDOW.get()))
+        return false;
+    lastWindow.reset();
+    return canvasToggleTiled(WINDOW);
+}
+
 // SUPER + SHIFT + arrows in a tiled place swap the window with its neighbour
 // that way; past the last one, it goes to the place the next screen that way
 // is showing.
@@ -11907,6 +11963,133 @@ void CScrollOverview::renderPlaceMenu(PHLMONITOR monitor) {
         drawCanvasText(label, CBox{item.box.x + INSET, item.box.y + 11.F * SCALE, item.box.width - INSET, item.box.height - 11.F * SCALE}, color,
                        sc<int>(std::round(15.F * SCALE)));
     }
+}
+
+// ---- Moving a place with the mouse, zoomed out ------------------------------------
+// Grab its number badge or its outline and drag: the place and its windows
+// go along. A click on the badge (no drag) goes there.
+struct SPlaceDrag {
+    int                                           place = 0;
+    const CScrollOverview*                        canvas = nullptr;
+    bool                                          badge = false, moved = false;
+    Vector2D                                      startLocal, startWorld, startCamera;
+    std::vector<std::pair<PHLWINDOWREF, CBox>>    windows;
+};
+static SPlaceDrag g_placeDrag;
+
+struct SPlaceRightClick {
+    int                    place = 0;
+    const CScrollOverview* canvas = nullptr;
+    Vector2D               local;
+};
+static SPlaceRightClick g_placeRightClick;
+
+int CScrollOverview::placeEdgeAt(const Vector2D& local) const {
+    const auto MONITOR = pMonitor.lock();
+    if (!MONITOR || !screenPlaces() || !isCanvasNavigationActive())
+        return 0;
+    const float SCALE = std::max(MONITOR->m_scale, 0.01F);
+    for (int place = 1; place <= 10; ++place) {
+        const auto CHROME = placeChrome(place, MONITOR);
+        if (!CHROME)
+            continue;
+        const auto OUTER = CHROME->inner.copy().expand(18.F * SCALE);
+        const auto INNER = CHROME->inner.copy().expand(-4.F * SCALE);
+        if (OUTER.containsPoint(local) && !INNER.containsPoint(local))
+            return place;
+    }
+    return 0;
+}
+
+static std::optional<Vector2D> canvasWorldAtLocal(const CScrollOverview* canvas, const PHLMONITOR& monitor, const Vector2D& local) {
+    const auto WORLD = canvas->canvasScreenToWorld(CBox{monitor->m_position + local / std::max(monitor->m_scale, 0.01F), {}}, false);
+    return WORLD ? std::optional<Vector2D>{WORLD->pos()} : std::nullopt;
+}
+
+bool CScrollOverview::placeDragPress(const Vector2D& local) {
+    const auto MONITOR = pMonitor.lock();
+    if (!MONITOR)
+        return false;
+    int        place = placeBadgeAt(local);
+    const bool BADGE = place != 0;
+    if (!place)
+        place = placeEdgeAt(local);
+    const auto OWNER = place ? placeMonitor(place) : nullptr;
+    const auto WORLD = OWNER ? canvasWorldAtLocal(this, MONITOR, local) : std::nullopt;
+    if (!WORLD)
+        return false;
+    g_placeDrag = SPlaceDrag{.place = place, .canvas = this, .badge = BADGE, .startLocal = local, .startWorld = *WORLD, .startCamera = placeCamera(place)};
+    const auto BOX = placeWorldBox(place, OWNER);
+    for (const auto& windowRef : Desktop::windowState()->windows())
+        if (const auto WINDOW = getOverviewWindowToShow(windowRef); shouldShowOverviewWindow(WINDOW) && !WINDOW->m_pinned && BOX.containsPoint(placeWindowBox(WINDOW).middle()) &&
+            std::ranges::none_of(g_placeDrag.windows, [&WINDOW](const auto& entry) { return entry.first.lock() == WINDOW; }))
+            g_placeDrag.windows.emplace_back(WINDOW, placeWindowBox(WINDOW));
+    return true;
+}
+
+bool CScrollOverview::placeDragMotion(const Vector2D& local) {
+    if (!g_placeDrag.place || g_placeDrag.canvas != this)
+        return false;
+    const auto MONITOR = pMonitor.lock();
+    const auto WORLD   = MONITOR ? canvasWorldAtLocal(this, MONITOR, local) : std::nullopt;
+    if (!WORLD)
+        return true;
+    if (!g_placeDrag.moved && local.distanceSq(g_placeDrag.startLocal) < std::pow(8.F * std::max(MONITOR->m_scale, 0.01F), 2))
+        return true;
+    g_placeDrag.moved       = true;
+    const Vector2D DELTA    = Vector2D{std::round(WORLD->x - g_placeDrag.startWorld.x), std::round(WORLD->y - g_placeDrag.startWorld.y)};
+    placeState().cameras[g_placeDrag.place] = g_placeDrag.startCamera + DELTA;
+    for (const auto& [ref, box] : g_placeDrag.windows) {
+        const auto WINDOW = ref.lock();
+        const auto TARGET = WINDOW ? WINDOW->layoutTarget() : nullptr;
+        if (!TARGET)
+            continue;
+        TARGET->setPositionGlobal(CBox{box.pos() + DELTA, box.size()});
+        TARGET->warpPositionSize();
+    }
+    for (const auto& overview : scrollOverviews())
+        overview->damage();
+    return true;
+}
+
+bool CScrollOverview::placeDragRelease() {
+    if (!g_placeDrag.place || g_placeDrag.canvas != this)
+        return false;
+    const auto DRAG = std::exchange(g_placeDrag, SPlaceDrag{});
+    if (DRAG.moved) {
+        savePlaceState();
+        const auto DELTA = placeCamera(DRAG.place) - DRAG.startCamera;
+        for (const auto& [ref, box] : DRAG.windows)
+            if (const auto WINDOW = ref.lock(); WINDOW)
+                if (const auto IT = g_placeTiled.find(WINDOW.get()); IT != g_placeTiled.end())
+                    IT->second.translate(DELTA);
+        if (const auto OWNER = placeMonitor(DRAG.place); OWNER && tilingPlaces())
+            tilePlace(DRAG.place, OWNER, false);
+        noteCanvasLayoutChanged();
+    } else if (DRAG.badge)
+        canvasPlaceAction("go " + std::to_string(DRAG.place));
+    damage();
+    return true;
+}
+
+void CScrollOverview::placeRightPress(const Vector2D& world, const Vector2D& local) {
+    g_placeRightClick = {};
+    if (!screenPlaces() || !isCanvasNavigationActive())
+        return;
+    for (int place = 1; place <= 10; ++place)
+        if (const auto OWNER = placeMonitor(place); OWNER && placeWorldBox(place, OWNER).containsPoint(world)) {
+            g_placeRightClick = {.place = place, .canvas = this, .local = local};
+            return;
+        }
+}
+
+bool CScrollOverview::placeRightRelease(const Vector2D& local, bool resized) {
+    const auto CLICK = std::exchange(g_placeRightClick, SPlaceRightClick{});
+    const auto MONITOR = pMonitor.lock();
+    if (!CLICK.place || CLICK.canvas != this || resized || !MONITOR || local.distanceSq(CLICK.local) > std::pow(8.F * std::max(MONITOR->m_scale, 0.01F), 2))
+        return false;
+    openPlaceMenu(CLICK.place, local);
+    return true;
 }
 
 // Right-click on the canvas, off any window: on empty canvas, the lowest
