@@ -459,6 +459,7 @@ static SP<SHyprCtlCommand> g_stateCommand;
 void canvasFullscreenReset();
 bool canvasToggleFill(PHLWINDOW window);
 bool canvasTogglePin(PHLWINDOW window);
+void notePlacePointerButton(bool pressed);
 
 static SDispatchResult onOverviewDispatcher(std::string arg) {
     const auto [ACTION, TARGET] = splitOverviewArg(arg);
@@ -891,6 +892,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     static auto P = Event::bus()->m_events.render.pre.listen([](PHLMONITOR monitor) {
         if (const auto overview = scrollOverviewForMonitor(monitor))
             overview->onPreRender();
+    });
+    static auto PLACEBUTTONS = Event::bus()->m_events.input.mouse.button.listen([](IPointer::SButtonEvent event, Event::SCallbackInfo&) {
+        notePlacePointerButton(event.state == WL_POINTER_BUTTON_STATE_PRESSED);
     });
     static auto HUDSTAGE = Event::bus()->m_events.render.stage.listen([](eRenderStage stage) {
         if (stage == RENDER_LAST_MOMENT)

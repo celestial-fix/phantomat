@@ -67,6 +67,9 @@ class CScrollOverview : public IOverview {
     void         refreshCanvasSettings();
     bool         flightDeckAction(const std::string& action);
     bool         canvasPlaceAction(const std::string& action);
+    bool         nudgeInPlace(PHLWINDOW window, const Vector2D& direction);
+    void         reconcilePlaces();
+    void         renderPlaceOutlines(PHLMONITOR monitor);
     bool   tunerKeyAction(uint32_t keysym, uint32_t mods, const std::string& text);
     bool         navigatorKeyAction(uint32_t keysym, uint32_t mods, const std::string& text, bool repeat);
     bool         openNavigator(const std::string& query = {});

@@ -82,6 +82,10 @@ hl.config({
       canvas = {
         enabled = true,
         desktop_mode = true,
+        linked_screens = true,  -- false: each screen has its own camera
+        places = false,         -- SUPER + 1…0 go to places on the canvas (experimental)
+        place_monitors = "",    -- the screen each place lands on, e.g. "1-5:DP-1 6-10:HDMI-A-1"
+        tile_places = false,    -- windows in a place tile to fill its screen
         persistent = true,
         initial_zoom = 0.72,
         min_zoom = 0.15,

@@ -357,6 +357,12 @@ static void registerConfigValues() {
     HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE,
                                   makeShared<CBoolValue>("plugin:spatialoverview:canvas:places", "workspace keys go to places on the canvas (experimental); off, they do nothing on the canvas", false));
     HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE,
+                                  makeShared<CStringValue>("plugin:spatialoverview:canvas:place_monitors",
+                                                           "the screen each place lands on, as \"1-5:DP-1 6-10:HDMI-A-1\"; unlisted places stay on the screen they were first visited from",
+                                                           Hyprlang::STRING{""}));
+    HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE,
+                                  makeShared<CBoolValue>("plugin:spatialoverview:canvas:tile_places", "windows in a place tile to fill its screen", false));
+    HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE,
                                   makeShared<CFloatValue>("plugin:spatialoverview:canvas:initial_zoom", "initial shared-canvas camera zoom", 0.72F,
                                                           SFloatValueOptions{.min = 0.1F, .max = 2.F}));
     HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE,
@@ -650,6 +656,14 @@ bool getCanvasDesktopMode() {
 
 bool getCanvasPlaces() {
     return getValue<bool>("plugin:spatialoverview:canvas:places");
+}
+
+std::string getCanvasPlaceMonitors() {
+    return getValue<std::string>("plugin:spatialoverview:canvas:place_monitors");
+}
+
+bool getCanvasTilePlaces() {
+    return getValue<bool>("plugin:spatialoverview:canvas:tile_places");
 }
 
 bool getCanvasLinkedScreens() {
