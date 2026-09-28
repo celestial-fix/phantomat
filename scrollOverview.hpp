@@ -12,6 +12,7 @@
 #include <hyprland/src/render/Framebuffer.hpp>
 #include <hyprland/src/render/types.hpp>
 #include <chrono>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -23,6 +24,7 @@
 
 class CMonitor;
 struct wl_event_source;
+struct SPlaceChrome;
 
 class CScrollOverview : public IOverview {
   public:
@@ -69,6 +71,8 @@ class CScrollOverview : public IOverview {
     bool         canvasPlaceAction(const std::string& action);
     bool         nudgeInPlace(PHLWINDOW window, const Vector2D& direction);
     bool         placeClick(const Vector2D& world);
+    int          placeCloseAt(const Vector2D& local) const;
+    std::optional<SPlaceChrome> placeChrome(int place, const PHLMONITOR& monitor) const;
     void         reconcilePlaces();
     void         renderPlaceOutlines(PHLMONITOR monitor);
     bool   tunerKeyAction(uint32_t keysym, uint32_t mods, const std::string& text);

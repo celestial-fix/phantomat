@@ -121,6 +121,7 @@ static int g_userFollowMouse = 1; // input:follow_mouse as set before the canvas
 // Places (see canvasPlaceAction), defined with them at the end.
 static void notePlaceWindow(const PHLWINDOW& window, bool opened);
 static int  placeAt(const PHLMONITOR& monitor, const Vector2D& world);
+static void removePlace(int place);
 // Going to a place at 100% shows the minimap for a moment (see canvasPlaceAction).
 static Time::steady_tp g_minimapFlashStart, g_minimapFlashUntil;
 static float minimapFlashAlpha(const Time::steady_tp& now) {
@@ -1809,6 +1810,17 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
                     navigatorSwallowedButtons.emplace(event.button);
                     if (HIT >= 0 && ROWWINDOW)
                         landOnWindow(ROWWINDOW);
+                    requestInputFrame();
+                    return;
+                }
+            }
+
+            if (event.button == MAIN && event.state == WL_POINTER_BUTTON_STATE_PRESSED && !clientGestureButton) {
+                if (const int PLACE = placeCloseAt(lastMousePosLocal); PLACE) {
+                    info.cancelled = true;
+                    navigatorSwallowedButtons.emplace(event.button);
+                    removePlace(PLACE);
+                    damage();
                     requestInputFrame();
                     return;
                 }
@@ -11288,6 +11300,45 @@ bool CScrollOverview::nudgeInPlace(PHLWINDOW window, const Vector2D& direction) 
     return true;
 }
 
+// Monitor-local, in pixels: the place's box on this canvas, its number badge
+// and the × beside it that takes the place away.
+struct SPlaceChrome {
+    CBox inner, badge, close;
+};
+
+std::optional<SPlaceChrome> CScrollOverview::placeChrome(int place, const PHLMONITOR& monitor) const {
+    const auto OWNER = placeMonitor(place);
+    if (!OWNER || !monitor)
+        return std::nullopt;
+    const float SCALE  = std::max(monitor->m_scale, 0.01F);
+    const auto  SCREEN = canvasWorldToScreen(placeWorldBox(place, OWNER));
+    const CBox  INNER  = CBox{(SCREEN.pos() - monitor->m_position) * SCALE, SCREEN.size() * SCALE}.round();
+    const float BADGE  = 40.F * SCALE;
+    const CBox  NUMBER = CBox{INNER.x + 14.F * SCALE, INNER.y + 14.F * SCALE, place == 10 ? BADGE * 1.4F : BADGE, BADGE}.round();
+    return SPlaceChrome{INNER, NUMBER, CBox{NUMBER.x + NUMBER.width + 8.F * SCALE, NUMBER.y, BADGE, BADGE}.round()};
+}
+
+int CScrollOverview::placeCloseAt(const Vector2D& local) const {
+    const auto MONITOR = pMonitor.lock();
+    if (!MONITOR || !ScrollOverview::Config::getCanvasPlaces() || !isCanvasNavigationActive())
+        return 0;
+    for (int place = 1; place <= 10; ++place)
+        if (const auto CHROME = placeChrome(place, MONITOR); CHROME && CHROME->close.containsPoint(local))
+            return place;
+    return 0;
+}
+
+// Its windows stay where they are on the canvas, no longer tiled.
+static void removePlace(int place) {
+    placeState().monitors.erase(place);
+    placeState().cameras.erase(place);
+    savePlaceState();
+    g_places.erase(place);
+    g_placeOrder.erase(place);
+    if (g_previousPlace == place)
+        g_previousPlace = 0;
+}
+
 // Zoomed out, each place a screen has is outlined and numbered, just outside
 // it, since tiled windows cover all of it.
 void CScrollOverview::renderPlaceOutlines(PHLMONITOR monitor) {
@@ -11298,15 +11349,12 @@ void CScrollOverview::renderPlaceOutlines(PHLMONITOR monitor) {
         return;
     const float SCALE = std::max(monitor->m_scale, 0.01F);
     const auto  THEME = SpatialOverview::Hud::theme();
+    const int HOVERED = placeCloseAt(lastMousePosLocal);
     for (int place = 1; place <= 10; ++place) {
-        const auto OWNER = placeMonitor(place);
-        if (!OWNER)
+        const auto CHROME = placeChrome(place, monitor);
+        if (!CHROME || !CHROME->inner.overlaps(CBox{{}, monitor->m_size * SCALE}))
             continue;
-        const auto SCREEN = canvasWorldToScreen(placeWorldBox(place, OWNER));
-        CBox       box{(SCREEN.pos() - monitor->m_position) * SCALE, SCREEN.size() * SCALE};
-        if (!box.overlaps(CBox{{}, monitor->m_size * SCALE}))
-            continue;
-        const CBox INNER = box.copy().round();
+        CBox box = CHROME->inner;
         box.expand(8.F * SCALE).round();
         CBorderPassElement::SBorderData border;
         border.box           = box;
@@ -11319,16 +11367,25 @@ void CScrollOverview::renderPlaceOutlines(PHLMONITOR monitor) {
         g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(border));
 
         // The number on a badge in the corner, over the windows.
-        const float                 BADGE = 40.F * SCALE;
         CRectPassElement::SRectData badge;
-        badge.box           = CBox{INNER.x + 14.F * SCALE, INNER.y + 14.F * SCALE, place == 10 ? BADGE * 1.4F : BADGE, BADGE}.round();
+        badge.box           = CHROME->badge;
         badge.color         = THEME.accent;
         badge.color.a       = 0.92F * FADE;
         badge.round         = sc<int>(std::round(9.F * SCALE));
         badge.roundingPower = 2.F;
         g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(badge));
-        drawCanvasText(std::to_string(place), CBox{badge.box.x + 12.F * SCALE, badge.box.y + 5.F * SCALE, badge.box.width, BADGE}, CHyprColor{0.04F, 0.04F, 0.05F, FADE},
-                       sc<int>(std::round(20.F * SCALE)));
+        drawCanvasText(std::to_string(place), CBox{badge.box.x + 12.F * SCALE, badge.box.y + 5.F * SCALE, badge.box.width, badge.box.height},
+                       CHyprColor{0.04F, 0.04F, 0.05F, FADE}, sc<int>(std::round(20.F * SCALE)));
+
+        CRectPassElement::SRectData close;
+        close.box           = CHROME->close;
+        close.color         = HOVERED == place ? CHyprColor{0.86F, 0.3F, 0.32F, 0.95F * FADE} : CHyprColor{0.04F, 0.04F, 0.05F, 0.7F * FADE};
+        close.round         = badge.round;
+        close.roundingPower = 2.F;
+        g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(close));
+        auto cross = THEME.text;
+        cross.a    = FADE;
+        drawCanvasText("×", CBox{close.box.x + 12.F * SCALE, close.box.y + 3.F * SCALE, close.box.width, close.box.height}, cross, sc<int>(std::round(24.F * SCALE)));
     }
 }
 
@@ -11566,13 +11623,7 @@ bool CScrollOverview::placeClick(const Vector2D& world) {
         });
         if (!EMPTY)
             return canvasPlaceAction("go " + std::to_string(place));
-        placeState().monitors.erase(place);
-        placeState().cameras.erase(place);
-        savePlaceState();
-        g_places.erase(place);
-        g_placeOrder.erase(place);
-        if (g_previousPlace == place)
-            g_previousPlace = 0;
+        removePlace(place);
         damage();
         return true;
     }
