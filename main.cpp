@@ -459,6 +459,7 @@ static SP<SHyprCtlCommand> g_stateCommand;
 void canvasFullscreenReset();
 bool canvasToggleFill(PHLWINDOW window);
 bool canvasToggleTiled(PHLWINDOW window); // scrollOverview.cpp
+bool canvasPlaceKeyWhileFullscreen(const PHLMONITOR& focused, const std::string& action);
 bool canvasTogglePin(PHLWINDOW window);
 void notePlacePointerButton(bool pressed);
 
@@ -642,6 +643,9 @@ static SDispatchResult onCanvasDispatcher(std::string arg) {
     if (arg == "noop")
         return std::ranges::any_of(scrollOverviews(), [](const auto& overview) { return overview && !overview->isClosing(); }) ? SDispatchResult{}
                                                                                                                                 : SDispatchResult{.success = false, .error = "Open the canvas before using this action"};
+    if (!CANVAS && (arg.starts_with("go ") || arg.starts_with("send ") || arg.starts_with("assign ")) &&
+        canvasPlaceKeyWhileFullscreen(Desktop::focusState()->monitor(), arg))
+        return {};
     if (!CANVAS)
         return arg == "refresh" ? SDispatchResult{} : SDispatchResult{.success = false, .error = "Open the canvas before using this action"};
     if (arg == "back" || arg == "land" || arg == "frame" || arg == "undo" || arg == "redo" || arg == "fit" || arg == "summon" || arg == "search" || arg == "tune" ||
