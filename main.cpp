@@ -641,7 +641,7 @@ static SDispatchResult onCanvasDispatcher(std::string arg) {
         return arg == "refresh" ? SDispatchResult{} : SDispatchResult{.success = false, .error = "Open the canvas before using this action"};
     if (arg == "back" || arg == "land" || arg == "frame" || arg == "undo" || arg == "redo" || arg == "fit" || arg == "summon" || arg == "search" || arg == "tune" ||
         arg.starts_with("search ") || arg.starts_with("zoom ") || arg.starts_with("pan ") || arg.starts_with("nudge ") || arg.starts_with("area ") || arg.starts_with("go ") ||
-        arg.starts_with("send "))
+        arg.starts_with("send ") || arg.starts_with("assign "))
         return CANVAS->flightDeckAction(arg) ? SDispatchResult{} : SDispatchResult{.success = false, .error = "No matching window, area or undo state"};
 
     std::istringstream stream{arg};

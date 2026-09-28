@@ -84,7 +84,7 @@ hl.config({
         desktop_mode = true,
         linked_screens = true,  -- false: each screen has its own camera
         places = false,         -- SUPER + 1…0 go to places on the canvas (experimental)
-        place_monitors = "",    -- the screen each place lands on, e.g. "1-5:DP-1 6-10:HDMI-A-1"
+        place_monitors = "",    -- optional starting screens, e.g. "1-5:DP-1"; SUPER + SHIFT + ALT + arrows move places
         tile_places = false,    -- windows in a place tile to fill its screen
         persistent = true,
         initial_zoom = 0.72,
@@ -288,7 +288,7 @@ local canvas_keys = {
 -- a group.
 table.insert(canvas_keys, { "SUPER + G", "Toggle window grouping", "noop", { hl.dsp.group.toggle() } })
 for _, move in ipairs({ { "LEFT", "l", "left" }, { "RIGHT", "r", "right" }, { "UP", "u", "up" }, { "DOWN", "d", "down" } }) do
-  table.insert(canvas_keys, { "SUPER + SHIFT + ALT + " .. move[1], "Move workspace to " .. move[3] .. " monitor", "noop", { hl.dsp.workspace.move({ monitor = move[2] }) } })
+  table.insert(canvas_keys, { "SUPER + SHIFT + ALT + " .. move[1], "Move place (canvas) / workspace to " .. move[3] .. " monitor", "assign " .. move[3], { hl.dsp.workspace.move({ monitor = move[2] }) } })
   table.insert(canvas_keys, { "SUPER + ALT + " .. move[1], "Move window to group on " .. move[3], "noop", { hl.dsp.window.move({ into_group = move[2] }) } })
 end
 for _, key in ipairs(canvas_keys) do
