@@ -78,7 +78,9 @@ class CScrollOverview : public IOverview {
     bool         placeDragPress(const Vector2D& local);
     bool         placeDragMotion(const Vector2D& local);
     bool         placeDragRelease();
-    void         placeRightPress(const Vector2D& world, const Vector2D& local);
+    void         placeRightPress(PHLWINDOW window, const Vector2D& local);
+    void         openWindowMenu(PHLWINDOW window, const Vector2D& local);
+    bool         sendWindowTo(PHLWINDOW window, int place, PHLMONITOR screen);
     bool         placeRightRelease(const Vector2D& local, bool resized);
     bool         movePlace(int place, const PHLMONITOR& to);
     void         openPlaceMenu(int place, const Vector2D& local);

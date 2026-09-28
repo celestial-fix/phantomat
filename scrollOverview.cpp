@@ -1876,11 +1876,12 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
                 const auto WORLD = canvasScreenToWorld(CBox{MONITOR->m_position + lastMousePosLocal / MONITOR->m_scale, {}}, false);
                 if (BADGE)
                     openPlaceMenu(BADGE, lastMousePosLocal);
-                // On a window, a click (no drag) opens the menu on release;
-                // a drag still resizes.
-                const bool ONWINDOW = !BADGE && windowAtOverviewCursor();
-                if (ONWINDOW && WORLD && navigatorOwnsPointer())
-                    placeRightPress(WORLD->pos(), lastMousePosLocal);
+                // On a window, a click (no drag) opens the window's menu on
+                // release; a drag still resizes.
+                const auto CLICKED  = BADGE ? PHLWINDOW{} : windowAtOverviewCursor();
+                const bool ONWINDOW = CLICKED != nullptr;
+                if (ONWINDOW && navigatorOwnsPointer())
+                    placeRightPress(CLICKED, lastMousePosLocal);
                 if (BADGE || (WORLD && !ONWINDOW && placeClick(WORLD->pos(), lastMousePosLocal))) {
                     info.cancelled = true;
                     navigatorSwallowedButtons.emplace(event.button);
@@ -11767,10 +11768,11 @@ static void renumberPlace(int from, int to) {
 
 // ---- The place menu: right-click a place, zoomed out ----------------------------------
 struct SPlaceMenu {
-    int           place = 0;
+    int           place = 0; // the place; for a window, the one it is in (or 0)
+    PHLWINDOWREF  window;    // set: the menu of a window
     PHLMONITORREF monitor;
     Vector2D      anchor; // monitor-local pixels
-    int           page = 0; // 0 actions, 1 numbers, 2 screens
+    int           page = 0; // place: 0 actions, 1 numbers, 2 screens; window: 10 actions, 11 spaces, 12 screens
 };
 static SPlaceMenu g_placeMenu;
 
@@ -11782,7 +11784,22 @@ enum ePlaceMenuItem : uint8_t {
     PLACE_MENU_BACK,
     PLACE_MENU_NUMBER,
     PLACE_MENU_SCREEN,
+    WINDOW_MENU_SPACES,
+    WINDOW_MENU_SCREENS,
+    WINDOW_MENU_PLACE,
+    WINDOW_MENU_SEND_PLACE,
+    WINDOW_MENU_SEND_SCREEN,
 };
+
+static int placeOfWindow(const PHLWINDOW& window) {
+    if (!window)
+        return 0;
+    const auto CENTER = placeWindowBox(window).middle();
+    for (int place = 1; place <= 10; ++place)
+        if (const auto OWNER = placeMonitor(place); OWNER && placeWorldBox(place, OWNER).containsPoint(CENTER))
+            return place;
+    return 0;
+}
 
 struct SPlaceMenuItem {
     CBox           box;
@@ -11800,17 +11817,39 @@ struct SPlaceMenuLayout {
 };
 
 static std::optional<SPlaceMenuLayout> placeMenuLayout(const PHLMONITOR& monitor) {
-    if (!g_placeMenu.place || !monitor || g_placeMenu.monitor.lock() != monitor)
+    if (!monitor || g_placeMenu.monitor.lock() != monitor)
         return std::nullopt;
-    const auto OWNER = placeMonitor(g_placeMenu.place);
-    if (!OWNER)
+    const auto WINDOW    = g_placeMenu.window.lock();
+    const bool FORWINDOW = g_placeMenu.page >= 10;
+    if (FORWINDOW && !WINDOW)
+        return std::nullopt;
+    const auto OWNER = g_placeMenu.place ? placeMonitor(g_placeMenu.place) : nullptr;
+    if (!FORWINDOW && !OWNER)
         return std::nullopt;
     const float      SCALE = std::max(monitor->m_scale, 0.01F);
     const float      WIDTH = 280.F * SCALE, ROW = 44.F * SCALE, PAD = 8.F * SCALE, TITLE = 40.F * SCALE;
     SPlaceMenuLayout layout;
-    layout.title = "Space " + std::to_string(g_placeMenu.place) + "  ·  " + OWNER->m_name;
+    if (FORWINDOW) {
+        layout.title = WINDOW->m_title.empty() ? WINDOW->m_class : WINDOW->m_title;
+        if (layout.title.size() > 30)
+            layout.title = layout.title.substr(0, 29) + "…";
+    } else
+        layout.title = "Space " + std::to_string(g_placeMenu.place) + "  ·  " + OWNER->m_name;
     std::vector<SPlaceMenuItem> rows;
-    if (g_placeMenu.page == 0) {
+    if (g_placeMenu.page == 10) {
+        rows.push_back({.label = "Send to space  ›", .kind = WINDOW_MENU_SPACES});
+        if (State::monitorState()->monitors().size() > 1)
+            rows.push_back({.label = "Send to screen  ›", .kind = WINDOW_MENU_SCREENS});
+        if (OWNER)
+            rows.push_back({.label = "Space " + std::to_string(g_placeMenu.place) + "  ›", .kind = WINDOW_MENU_PLACE});
+    } else if (g_placeMenu.page == 12) {
+        rows.push_back({.label = "‹  Back", .kind = PLACE_MENU_BACK});
+        const auto HERE = OWNER ? OWNER : WINDOW->m_monitor.lock();
+        for (const auto& screen : State::monitorState()->monitors())
+            if (screen && screen->m_enabled)
+                rows.push_back({.label = screen->m_name + "  " + std::to_string(sc<int>(screen->m_size.x)) + "×" + std::to_string(sc<int>(screen->m_size.y)),
+                                .kind  = WINDOW_MENU_SEND_SCREEN, .screen = screen, .current = screen == HERE});
+    } else if (g_placeMenu.page == 0) {
         rows.push_back({.label = "Go to space", .kind = PLACE_MENU_GO});
         rows.push_back({.label = "Change number  ›", .kind = PLACE_MENU_NUMBERS});
         if (State::monitorState()->monitors().size() > 1)
@@ -11826,7 +11865,8 @@ static std::optional<SPlaceMenuLayout> placeMenuLayout(const PHLMONITOR& monitor
         rows.push_back({.label = "‹  Back", .kind = PLACE_MENU_BACK});
 
     // Numbers: a 5 × 2 grid under the back row; taken ones swap.
-    const float GRIDROWS = g_placeMenu.page == 1 ? 2.F : 0.F;
+    const bool  GRID     = g_placeMenu.page == 1 || g_placeMenu.page == 11;
+    const float GRIDROWS = GRID ? 2.F : 0.F;
     const float HEIGHT   = TITLE + rows.size() * ROW + GRIDROWS * ROW + PAD * 2.F;
     Vector2D    pos      = g_placeMenu.anchor;
     pos.x                = std::clamp(pos.x, 0.0, std::max(0.0, monitor->m_size.x * SCALE - WIDTH));
@@ -11839,15 +11879,15 @@ static std::optional<SPlaceMenuLayout> placeMenuLayout(const PHLMONITOR& monitor
         y += ROW;
         layout.items.push_back(std::move(row));
     }
-    if (g_placeMenu.page == 1) {
+    if (GRID) {
         const float CELL = (WIDTH - PAD * 2.F) / 5.F;
         for (int number = 1; number <= 10; ++number) {
             const int INDEX = number - 1;
             layout.items.push_back({.box     = CBox{layout.frame.x + PAD + (INDEX % 5) * CELL, y + (INDEX / 5) * ROW, CELL, ROW}.round(),
                                     .label   = std::to_string(number),
-                                    .kind    = PLACE_MENU_NUMBER,
+                                    .kind    = FORWINDOW ? WINDOW_MENU_SEND_PLACE : PLACE_MENU_NUMBER,
                                     .number  = number,
-                                    .current = number == g_placeMenu.place || placeMonitorName(number).has_value()});
+                                    .current = !FORWINDOW && (number == g_placeMenu.place || placeMonitorName(number).has_value())});
         }
     }
     return layout;
@@ -11858,8 +11898,68 @@ void CScrollOverview::openPlaceMenu(int place, const Vector2D& local) {
     damage();
 }
 
+void CScrollOverview::openWindowMenu(PHLWINDOW window, const Vector2D& local) {
+    window      = getOverviewWindowToShow(window);
+    g_placeMenu = SPlaceMenu{.place = placeOfWindow(window), .window = window, .monitor = pMonitor, .anchor = local, .page = 10};
+    damage();
+}
+
 bool CScrollOverview::placeMenuOpen() const {
-    return g_placeMenu.place && g_placeMenu.monitor.lock() == pMonitor.lock();
+    return (g_placeMenu.place || !g_placeMenu.window.expired()) && g_placeMenu.monitor.lock() == pMonitor.lock();
+}
+
+// The window to place N, at the same spot in it as in the place it was in
+// (centered, from outside one); to a screen, into the place that screen
+// shows, or the middle of its view. A tiled place tiles it.
+bool CScrollOverview::sendWindowTo(PHLWINDOW window, int place, PHLMONITOR screen) {
+    window            = getOverviewWindowToShow(window);
+    const auto TARGET = shouldShowOverviewWindow(window) && !window->m_pinned ? window->layoutTarget() : nullptr;
+    if (!TARGET)
+        return false;
+    CBox destination;
+    if (!place && screen) {
+        const auto* CANVAS = canvasOf(scrollOverviewForMonitor(screen));
+        const auto  CAMERA = CANVAS ? CANVAS->viewOffset->goal() : Vector2D{};
+        place              = placeAt(screen, screen->logicalBox().middle() + CAMERA);
+        if (!place)
+            destination = CBox{screen->m_position + CAMERA, screen->m_size};
+    }
+    const int FROM = placeOfWindow(window);
+    if (place) {
+        if (place == FROM)
+            return true;
+        auto owner = placeMonitor(place);
+        if (!owner) {
+            owner = screen ? screen : pMonitor.lock();
+            assignPlaceMonitor(place, owner->m_name);
+        }
+        destination = placeWorldBox(place, owner);
+    }
+    if (destination.empty())
+        return false;
+    checkpointCanvas();
+    auto box   = placeWindowBox(window);
+    box.width  = std::min(box.width, destination.width);
+    box.height = std::min(box.height, destination.height);
+    if (const auto FROMOWNER = FROM ? placeMonitor(FROM) : nullptr; FROMOWNER) {
+        const auto FROMBOX = placeWorldBox(FROM, FROMOWNER);
+        box.x              = destination.x + std::clamp(box.x - FROMBOX.x, 0.0, destination.width - box.width);
+        box.y              = destination.y + std::clamp(box.y - FROMBOX.y, 0.0, destination.height - box.height);
+    } else {
+        box.x = destination.x + (destination.width - box.width) / 2.0;
+        box.y = destination.y + (destination.height - box.height) / 2.0;
+    }
+    TARGET->setPositionGlobal(box);
+    TARGET->warpPositionSize();
+    window->sendWindowSize(true);
+    for (auto& [_, order] : g_placeOrder)
+        std::erase_if(order, [&window](const PHLWINDOWREF& ref) { return ref.lock() == window; });
+    if (place)
+        g_placeOrder[place].push_back(window);
+    g_placeTiled.erase(window.get());
+    for (const auto& overview : scrollOverviews())
+        overview->damage();
+    return true;
 }
 
 // A press while the menu is open runs what it hit; one anywhere else only
@@ -11878,14 +11978,26 @@ bool CScrollOverview::placeMenuPress(const Vector2D& local, bool main) {
     }
     if (!main)
         return true;
-    const int PLACE = g_placeMenu.place;
+    const int  PLACE  = g_placeMenu.place;
+    const auto WINDOW = g_placeMenu.window.lock();
     for (const auto& item : LAYOUT->items) {
         if (!item.box.containsPoint(local))
             continue;
         switch (item.kind) {
             case PLACE_MENU_NUMBERS: g_placeMenu.page = 1; break;
             case PLACE_MENU_SCREENS: g_placeMenu.page = 2; break;
-            case PLACE_MENU_BACK: g_placeMenu.page = 0; break;
+            case PLACE_MENU_BACK: g_placeMenu.page = g_placeMenu.page >= 10 ? 10 : 0; break;
+            case WINDOW_MENU_SPACES: g_placeMenu.page = 11; break;
+            case WINDOW_MENU_SCREENS: g_placeMenu.page = 12; break;
+            case WINDOW_MENU_PLACE: g_placeMenu.page = 0; break;
+            case WINDOW_MENU_SEND_PLACE:
+                g_placeMenu = {};
+                sendWindowTo(WINDOW, item.number, nullptr);
+                break;
+            case WINDOW_MENU_SEND_SCREEN:
+                g_placeMenu = {};
+                sendWindowTo(WINDOW, 0, item.screen);
+                break;
             case PLACE_MENU_GO:
                 g_placeMenu = {};
                 canvasPlaceAction("go " + std::to_string(PLACE));
@@ -11910,7 +12022,7 @@ bool CScrollOverview::placeMenuPress(const Vector2D& local, bool main) {
 }
 
 void CScrollOverview::renderPlaceMenu(PHLMONITOR monitor) {
-    if (g_placeMenu.place && g_placeMenu.monitor.lock() == monitor && !isCanvasNavigationActive())
+    if (g_placeMenu.monitor.lock() == monitor && !isCanvasNavigationActive())
         g_placeMenu = {};
     const auto LAYOUT = placeMenuLayout(monitor);
     if (!LAYOUT)
@@ -11957,7 +12069,7 @@ void CScrollOverview::renderPlaceMenu(PHLMONITOR monitor) {
         if (!HOVER && CELL && item.current && item.number != g_placeMenu.place)
             color.a = 0.45F; // taken: picking it swaps
         std::string label = item.label;
-        if (item.kind == PLACE_MENU_SCREEN && item.current)
+        if ((item.kind == PLACE_MENU_SCREEN || item.kind == WINDOW_MENU_SEND_SCREEN) && item.current)
             label = "✓  " + label;
         const float INSET = CELL ? item.box.width / 2.F - (item.number == 10 ? 11.F : 6.F) * SCALE : 14.F * SCALE;
         drawCanvasText(label, CBox{item.box.x + INSET, item.box.y + 11.F * SCALE, item.box.width - INSET, item.box.height - 11.F * SCALE}, color,
@@ -11978,7 +12090,7 @@ struct SPlaceDrag {
 static SPlaceDrag g_placeDrag;
 
 struct SPlaceRightClick {
-    int                    place = 0;
+    PHLWINDOWREF           window;
     const CScrollOverview* canvas = nullptr;
     Vector2D               local;
 };
@@ -12072,23 +12184,19 @@ bool CScrollOverview::placeDragRelease() {
     return true;
 }
 
-void CScrollOverview::placeRightPress(const Vector2D& world, const Vector2D& local) {
+void CScrollOverview::placeRightPress(PHLWINDOW window, const Vector2D& local) {
     g_placeRightClick = {};
-    if (!screenPlaces() || !isCanvasNavigationActive())
-        return;
-    for (int place = 1; place <= 10; ++place)
-        if (const auto OWNER = placeMonitor(place); OWNER && placeWorldBox(place, OWNER).containsPoint(world)) {
-            g_placeRightClick = {.place = place, .canvas = this, .local = local};
-            return;
-        }
+    if (screenPlaces() && isCanvasNavigationActive() && window)
+        g_placeRightClick = {.window = window, .canvas = this, .local = local};
 }
 
 bool CScrollOverview::placeRightRelease(const Vector2D& local, bool resized) {
-    const auto CLICK = std::exchange(g_placeRightClick, SPlaceRightClick{});
+    const auto CLICK   = std::exchange(g_placeRightClick, SPlaceRightClick{});
     const auto MONITOR = pMonitor.lock();
-    if (!CLICK.place || CLICK.canvas != this || resized || !MONITOR || local.distanceSq(CLICK.local) > std::pow(8.F * std::max(MONITOR->m_scale, 0.01F), 2))
+    const auto WINDOW  = CLICK.window.lock();
+    if (!WINDOW || CLICK.canvas != this || resized || !MONITOR || local.distanceSq(CLICK.local) > std::pow(8.F * std::max(MONITOR->m_scale, 0.01F), 2))
         return false;
-    openPlaceMenu(CLICK.place, local);
+    openWindowMenu(WINDOW, local);
     return true;
 }
 
