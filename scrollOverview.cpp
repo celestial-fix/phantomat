@@ -122,6 +122,7 @@ static int g_userFollowMouse = 1; // input:follow_mouse as set before the canvas
 static void notePlaceWindow(const PHLWINDOW& window, bool opened);
 static int  placeAt(const PHLMONITOR& monitor, const Vector2D& world);
 static void removePlace(int place);
+static bool placeTiling(int place);
 static bool canvasSnapDoubleClick(const PHLWINDOW& window, uint32_t timeMs);
 // Going to a place at 100% shows the minimap for a moment (see canvasPlaceAction).
 static Time::steady_tp g_minimapFlashStart, g_minimapFlashUntil;
@@ -4689,7 +4690,7 @@ bool CScrollOverview::manageCanvasWindow(PHLWINDOW window, bool placeNew) {
     CBox       PLACEMENT{WORLDCENTER - SIZE / 2.F, SIZE};
 
     // In a tiled place the tiling finds it a spot.
-    if (ScrollOverview::Config::getCanvasPlaces() && ScrollOverview::Config::getCanvasTilePlaces() && placeAt(MONITOR, WORLDCENTER)) {
+    if (const int PLACE = placeAt(MONITOR, WORLDCENTER); PLACE && placeTiling(PLACE)) {
         TARGET->rememberFloatingSize(SIZE);
         TARGET->setPositionGlobal(PLACEMENT);
         TARGET->warpPositionSize();
@@ -11018,6 +11019,7 @@ static std::filesystem::path placeMonitorsPath() {
 struct SPlaceState {
     std::map<int, std::string> monitors;
     std::map<int, Vector2D>    cameras;
+    std::map<int, bool>        tiling; // " tiled" / " free" at the end of the line: wins over canvas:tile_places
 };
 
 static SPlaceState& placeState() {
@@ -11027,12 +11029,14 @@ static SPlaceState& placeState() {
         std::ifstream in{placeMonitorsPath()};
         std::string   line;
         while (std::getline(in, line)) {
-            const auto AT = line.find('@');
+            const auto AT = std::min(line.find('@'), line.find(' '));
             for (const auto& [place, name] : parsePlaceMonitors(line.substr(0, AT))) {
                 state->monitors[place] = name;
                 double x = 0, y = 0;
-                if (AT != std::string::npos && std::sscanf(line.c_str() + AT + 1, "%lf,%lf", &x, &y) == 2)
+                if (AT != std::string::npos && line[AT] == '@' && std::sscanf(line.c_str() + AT + 1, "%lf,%lf", &x, &y) == 2)
                     state->cameras[place] = Vector2D{x, y};
+                if (line.ends_with(" free") || line.ends_with(" tiled"))
+                    state->tiling[place] = line.ends_with(" tiled");
             }
         }
     }
@@ -11049,6 +11053,8 @@ static void savePlaceState() {
         out << number << ':' << name;
         if (const auto IT = STATE.cameras.find(number); IT != STATE.cameras.end())
             out << '@' << sc<long>(std::lround(IT->second.x)) << ',' << sc<long>(std::lround(IT->second.y));
+        if (const auto IT = STATE.tiling.find(number); IT != STATE.tiling.end())
+            out << (IT->second ? " tiled" : " free");
         out << '\n';
     }
 }
@@ -11123,6 +11129,16 @@ static bool screenPlaces() {
     return ScrollOverview::Config::getCanvasPlaces() && !ScrollOverview::Config::getCanvasLinkedScreens();
 }
 
+// Whether a place tiles its windows: its own setting (the place menu), or
+// canvas:tile_places.
+static bool placeTiling(int place) {
+    if (!screenPlaces())
+        return false;
+    if (const auto IT = placeState().tiling.find(place); IT != placeState().tiling.end())
+        return IT->second;
+    return ScrollOverview::Config::getCanvasTilePlaces();
+}
+
 static int placeAt(const PHLMONITOR& monitor, const Vector2D& world) {
     if (!monitor || !screenPlaces())
         return 0;
@@ -11180,6 +11196,8 @@ static std::vector<CBox> placeTiles(CBox area, size_t count, double gap) {
 // dropped: windows were just let go of, so one dropped on another's tile
 // takes its turn there.
 static void tilePlace(int place, const PHLMONITOR& monitor, bool dropped) {
+    if (!placeTiling(place))
+        return;
     const auto             MEMBERS = placeMembers(place, monitor);
     auto&                  order   = g_placeOrder[place];
     std::vector<PHLWINDOW> tiled;
@@ -11243,8 +11261,9 @@ static void tilePlace(int place, const PHLMONITOR& monitor, bool dropped) {
     }
 }
 
+// Any place that tiles.
 static bool tilingPlaces() {
-    return screenPlaces() && ScrollOverview::Config::getCanvasTilePlaces();
+    return screenPlaces() && (ScrollOverview::Config::getCanvasTilePlaces() || std::ranges::any_of(placeState().tiling, [](const auto& entry) { return entry.second; }));
 }
 
 // Every frame, once for all screens: a place whose windows changed tiles
@@ -11262,7 +11281,7 @@ void CScrollOverview::reconcilePlaces() {
 
     for (int place = 1; place <= 10; ++place) {
         const auto MONITOR = placeMonitor(place);
-        if (!MONITOR)
+        if (!MONITOR || !placeTiling(place))
             continue;
         // Resized away from its tile (by mouse, key or the app), a window
         // leaves the tiling and keeps its size.
@@ -11306,6 +11325,8 @@ bool canvasToggleTiled(PHLWINDOW window) {
         const auto MONITOR = placeMonitor(place);
         if (!MONITOR || !placeWorldBox(place, MONITOR).containsPoint(CENTER))
             continue;
+        if (!placeTiling(place))
+            return false;
         if (!g_placeFloating.erase(window.get())) {
             g_placeFloating.emplace(window.get());
             g_placeTiled.erase(window.get());
@@ -11352,7 +11373,7 @@ bool CScrollOverview::nudgeInPlace(PHLWINDOW window, const Vector2D& direction) 
             place   = candidate;
             monitor = M;
         }
-    if (!place)
+    if (!place || !placeTiling(place))
         return false;
 
     const auto that_way = [&direction](const Vector2D& delta) {
@@ -11740,6 +11761,23 @@ bool CScrollOverview::movePlace(int place, const PHLMONITOR& to) {
     return true;
 }
 
+// The place menu's switch: tiled, its windows tile (floated ones too);
+// free, they stay where they are and move freely.
+static void setPlaceTiling(int place, bool on) {
+    const auto OWNER = placeMonitor(place);
+    if (!OWNER)
+        return;
+    placeState().tiling[place] = on;
+    savePlaceState();
+    const auto BOX = placeWorldBox(place, OWNER);
+    for (const auto& windowRef : Desktop::windowState()->windows())
+        if (const auto WINDOW = getOverviewWindowToShow(windowRef); WINDOW && BOX.containsPoint(placeWindowBox(WINDOW).middle())) {
+            g_placeFloating.erase(WINDOW.get());
+            g_placeTiled.erase(WINDOW.get());
+        }
+    tilePlace(place, OWNER, false);
+}
+
 // Place `from` takes number `to`, staying where it is; a place that had `to`
 // takes `from`, likewise.
 static void renumberPlace(int from, int to) {
@@ -11781,6 +11819,8 @@ enum ePlaceMenuItem : uint8_t {
     PLACE_MENU_NUMBERS,
     PLACE_MENU_SCREENS,
     PLACE_MENU_DELETE,
+    PLACE_MENU_TILING,
+    WINDOW_MENU_FLOAT,
     PLACE_MENU_BACK,
     PLACE_MENU_NUMBER,
     PLACE_MENU_SCREEN,
@@ -11840,6 +11880,8 @@ static std::optional<SPlaceMenuLayout> placeMenuLayout(const PHLMONITOR& monitor
         rows.push_back({.label = "Send to space  ›", .kind = WINDOW_MENU_SPACES});
         if (State::monitorState()->monitors().size() > 1)
             rows.push_back({.label = "Send to screen  ›", .kind = WINDOW_MENU_SCREENS});
+        if (OWNER && placeTiling(g_placeMenu.place))
+            rows.push_back({.label = g_placeFloating.contains(WINDOW.get()) ? "Tile window" : "Float window", .kind = WINDOW_MENU_FLOAT});
         if (OWNER)
             rows.push_back({.label = "Space " + std::to_string(g_placeMenu.place) + "  ›", .kind = WINDOW_MENU_PLACE});
     } else if (g_placeMenu.page == 12) {
@@ -11854,6 +11896,7 @@ static std::optional<SPlaceMenuLayout> placeMenuLayout(const PHLMONITOR& monitor
         rows.push_back({.label = "Change number  ›", .kind = PLACE_MENU_NUMBERS});
         if (State::monitorState()->monitors().size() > 1)
             rows.push_back({.label = "Move to screen  ›", .kind = PLACE_MENU_SCREENS});
+        rows.push_back({.label = placeTiling(g_placeMenu.place) ? "Tiling  ·  on" : "Tiling  ·  off (free)", .kind = PLACE_MENU_TILING});
         rows.push_back({.label = "Delete space", .kind = PLACE_MENU_DELETE});
     } else if (g_placeMenu.page == 2) {
         rows.push_back({.label = "‹  Back", .kind = PLACE_MENU_BACK});
@@ -11987,6 +12030,11 @@ bool CScrollOverview::placeMenuPress(const Vector2D& local, bool main) {
             case PLACE_MENU_NUMBERS: g_placeMenu.page = 1; break;
             case PLACE_MENU_SCREENS: g_placeMenu.page = 2; break;
             case PLACE_MENU_BACK: g_placeMenu.page = g_placeMenu.page >= 10 ? 10 : 0; break;
+            case PLACE_MENU_TILING: setPlaceTiling(PLACE, !placeTiling(PLACE)); break;
+            case WINDOW_MENU_FLOAT:
+                g_placeMenu = {};
+                canvasToggleTiled(WINDOW);
+                break;
             case WINDOW_MENU_SPACES: g_placeMenu.page = 11; break;
             case WINDOW_MENU_SCREENS: g_placeMenu.page = 12; break;
             case WINDOW_MENU_PLACE: g_placeMenu.page = 0; break;
