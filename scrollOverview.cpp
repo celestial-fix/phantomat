@@ -117,6 +117,9 @@ static std::string g_canvasCursorShape; // the cursor override the canvases set;
 static const CScrollOverview* g_linkedLeader = nullptr; // linked screens: whose camera the others take
 static Time::steady_tp        g_linkedLeaderMovedAt;    // when the leader last moved its own camera
 static int g_userFollowMouse = 1; // input:follow_mouse as set before the canvas turned it off
+// Places (see canvasPlaceAction), defined with them at the end.
+static void notePlaceWindow(const PHLWINDOW& window, bool opened);
+static int  placeAt(const PHLMONITOR& monitor, const Vector2D& world);
 // Going to a place at 100% shows the minimap for a moment (see canvasPlaceAction).
 static Time::steady_tp g_minimapFlashStart, g_minimapFlashUntil;
 static float minimapFlashAlpha(const Time::steady_tp& now) {
@@ -2149,6 +2152,7 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
             return;
 
         if (isCanvasDesktop() && window && window->m_monitor == pMonitor) {
+            notePlaceWindow(window, true);
             manageCanvasWindow(window, true);
             followCanvasWindow(window, false);
             noteCanvasLayoutChanged();
@@ -2166,6 +2170,7 @@ CScrollOverview::CScrollOverview(PHLWORKSPACE startedOn_, bool swipe_, PHLMONITO
             return;
 
         if (window) {
+            notePlaceWindow(window, false);
             g_canvasNativeLayout.erase(window->m_stableID);
             g_canvasSpatialLayout.erase(window->m_stableID);
             if (window->layoutTarget()) g_canvasManagedTargets.erase(window->layoutTarget().get());
@@ -4605,6 +4610,14 @@ bool CScrollOverview::manageCanvasWindow(PHLWINDOW window, bool placeNew) {
     const float STEPX      = SIZE.x + GAP;
     const float STEPY      = SIZE.y + GAP;
     CBox       PLACEMENT{WORLDCENTER - SIZE / 2.F, SIZE};
+
+    // In a tiled place the tiling finds it a spot.
+    if (ScrollOverview::Config::getCanvasPlaces() && ScrollOverview::Config::getCanvasTilePlaces() && placeAt(MONITOR, WORLDCENTER)) {
+        TARGET->rememberFloatingSize(SIZE);
+        TARGET->setPositionGlobal(PLACEMENT);
+        TARGET->warpPositionSize();
+        return true;
+    }
 
     const auto occupied = [&](const CBox& candidate) {
         for (const auto& existingRef : Desktop::windowState()->windows()) {
@@ -8892,6 +8905,7 @@ void CScrollOverview::onPreRender() {
 
     followLinkedCamera();
     syncCanvasWindowScreens();
+    reconcilePlaces();
 
     forceLayersAboveFullscreen();
     updateWorkspaceOverflow();
@@ -9075,6 +9089,7 @@ void CScrollOverview::render() {
         renderCanvasGrid(MONITOR, ACTIVEIDX, PITCH, SCALE);
         OverviewRender::flushPass(MONITOR);
         renderCanvasDesktopScene(MONITOR, SCALE, NOW);
+        renderPlaceOutlines(MONITOR);
         renderNavigatorReticle(MONITOR, NOW);
         renderDraggedWindow(MONITOR, ACTIVEIDX, PITCH, SCALE, NOW);
         renderExperimentChrome(MONITOR);
@@ -9859,6 +9874,8 @@ bool CScrollOverview::nudgeWindow(PHLWINDOW window, const Vector2D& direction, b
     const auto TARGET  = window ? window->layoutTarget() : nullptr;
     if (!isCanvasDesktop() || !MONITOR || !shouldShowOverviewWindow(window) || !TARGET || !TARGET->floating())
         return false;
+    if (nudgeInPlace(window, direction))
+        return true;
 
     if (checkpoint)
         checkpointCanvas();
@@ -10843,21 +10860,86 @@ bool CScrollOverview::flightDeckAction(const std::string& action) {
 // ---- Places: the workspace keys on the canvas ---------------------------------------
 // SUPER + 1…0 go to a place on the canvas, SHIFT + SUPER + N sends the focused
 // window there and follows it (SHIFT + ALT + SUPER + N: without following),
-// SUPER + TAB / SHIFT + SUPER + TAB step through the places that have windows,
-// CTRL + SUPER + TAB goes back to the place before. A place is a view of the
-// canvas (the camera of all screens, at 100%). At first the places are a row,
-// a screen-set apart, with the one numbered after the workspace you were on
-// where you are; each then remembers where you left its camera and which
-// window had focus there.
+// SUPER + TAB / SHIFT + SUPER + TAB step through the places of the screen you
+// are on, CTRL + SUPER + TAB goes back to the place before. A place is one
+// screen's worth of canvas and belongs to one screen: canvas:place_monitors
+// names it, otherwise it stays on the screen it was first visited from. Each
+// screen's places are a row, their columns a desk-width and more apart, so
+// linked screens land together on the places of the same column. With
+// canvas:tile_places the windows in a place tile to fill its screen, and
+// each place remembers which window had focus there.
 struct SCanvasPlace {
-    Vector2D     camera;
-    PHLWINDOWREF focus;
+    PHLWINDOWREF  focus;
+    PHLMONITORREF monitor;
 };
-static std::unordered_map<int, SCanvasPlace> g_places;
-static int                                   g_place = 0, g_previousPlace = 0, g_placeAnchor = 0;
-static Vector2D                              g_placeAnchorCamera;
+static std::unordered_map<int, SCanvasPlace>                   g_places;
+static int                                                     g_previousPlace = 0;
+static std::unordered_map<int, std::vector<PHLWINDOWREF>>      g_placeOrder;
+static std::unordered_map<const Desktop::View::CWindow*, CBox> g_placeTiled; // where tiling last put each window
+static std::unordered_set<const Desktop::View::CWindow*>       g_placeOpened; // new, so they tile last rather than where they were dropped
+static int                                                     g_placeHeldButtons = 0;
+static bool                                                    g_placeReleased    = false;
 
-// The screens side by side, and the distance between two places' views.
+static void notePlaceWindow(const PHLWINDOW& window, bool opened) {
+    if (!window)
+        return;
+    if (opened)
+        g_placeOpened.emplace(window.get());
+    else {
+        g_placeOpened.erase(window.get());
+        g_placeTiled.erase(window.get());
+    }
+}
+
+void notePlacePointerButton(bool pressed) {
+    g_placeHeldButtons = std::max(0, g_placeHeldButtons + (pressed ? 1 : -1));
+    if (!pressed)
+        g_placeReleased = true;
+}
+
+static const std::map<int, std::string>& placeMonitorNames() {
+    static std::string                parsed;
+    static std::map<int, std::string> names;
+    auto                              config = ScrollOverview::Config::getCanvasPlaceMonitors();
+    if (config == parsed)
+        return names;
+    parsed = config;
+    names.clear();
+    std::ranges::replace(config, ',', ' ');
+    std::istringstream stream{config};
+    std::string        entry;
+    while (stream >> entry) {
+        const auto COLON = entry.find(':');
+        if (COLON == std::string::npos || COLON + 1 >= entry.size())
+            continue;
+        const auto RANGE = entry.substr(0, COLON);
+        const auto DASH  = RANGE.find('-');
+        int        first = 0, last = 0;
+        try {
+            first = std::stoi(RANGE.substr(0, DASH));
+            last  = DASH == std::string::npos ? first : std::stoi(RANGE.substr(DASH + 1));
+        } catch (...) { continue; }
+        for (int place = std::max(1, first); place <= std::min(10, last); ++place)
+            names[place] = entry.substr(COLON + 1);
+    }
+    return names;
+}
+
+// The screen a place lands on; none for a place never visited that no
+// setting names (or whose screen is gone).
+static PHLMONITOR placeMonitor(int place) {
+    const auto& NAMES = placeMonitorNames();
+    if (const auto IT = NAMES.find(place); IT != NAMES.end())
+        for (const auto& monitor : State::monitorState()->monitors())
+            if (monitor && monitor->m_enabled && monitor->m_name == IT->second)
+                return monitor;
+    if (const auto IT = g_places.find(place); IT != g_places.end())
+        if (const auto MONITOR = IT->second.monitor.lock(); MONITOR && MONITOR->m_enabled)
+            return MONITOR;
+    return nullptr;
+}
+
+// The screens side by side.
 static CBox canvasScreensBox() {
     CBox box;
     for (const auto& monitor : State::monitorState()->monitors()) {
@@ -10874,10 +10956,309 @@ static CBox canvasScreensBox() {
     return box;
 }
 
+// A named place's column is its rank among its screen's named places, so the
+// screens' first places share a column, then their second ones, and so on.
+// Unnamed places come after all of those.
+static int placeColumn(int place) {
+    const auto& NAMES = placeMonitorNames();
+    const auto  IT    = NAMES.find(place);
+    if (IT == NAMES.end())
+        return NAMES.empty() ? place - 1 : 10 + place - 1;
+    return sc<int>(std::ranges::count_if(NAMES, [&](const auto& other) { return other.first < place && other.second == IT->second; }));
+}
+
+// Rounded, so a small change to the screens does not move every place.
 static Vector2D placeCamera(int place) {
-    if (const auto IT = g_places.find(place); IT != g_places.end())
-        return IT->second.camera;
-    return g_placeAnchorCamera + Vector2D{(place - g_placeAnchor) * canvasScreensBox().width * 1.5, 0.0};
+    const double PITCH = std::max(1000.0, std::ceil(canvasScreensBox().width * 1.25 / 1000.0) * 1000.0);
+    return Vector2D{placeColumn(place) * PITCH, 0.0};
+}
+
+static CBox placeWorldBox(int place, const PHLMONITOR& monitor) {
+    return monitor->logicalBox().translate(placeCamera(place));
+}
+
+static int placeAt(const PHLMONITOR& monitor, const Vector2D& world) {
+    if (!monitor || !ScrollOverview::Config::getCanvasPlaces())
+        return 0;
+    for (int place = 1; place <= 10; ++place)
+        if (placeMonitor(place) == monitor && placeWorldBox(place, monitor).containsPoint(world))
+            return place;
+    return 0;
+}
+
+static CBox placeWindowBox(const PHLWINDOW& window) {
+    return CBox{window->m_realPosition->goal(), window->m_realSize->goal()};
+}
+
+// Filled, fullscreen and pinned windows stand over the tiling.
+static bool placeTileable(const PHLWINDOW& window) {
+    const auto TARGET = window ? window->layoutTarget() : nullptr;
+    return shouldShowOverviewWindow(window) && TARGET && TARGET->floating() && !window->m_pinned && !Fullscreen::controller()->isFullscreen(window) &&
+        !(window->m_workspace && window->m_workspace->m_isSpecialWorkspace) && !g_canvasFill.contains(window.get());
+}
+
+static std::vector<PHLWINDOW> placeMembers(int place, const PHLMONITOR& monitor) {
+    std::vector<PHLWINDOW>                            members;
+    std::unordered_set<const Desktop::View::CWindow*> visited;
+    const auto                                        AREA = placeWorldBox(place, monitor);
+    for (const auto& windowRef : Desktop::windowState()->windows()) {
+        const auto WINDOW = getOverviewWindowToShow(windowRef);
+        if (placeTileable(WINDOW) && visited.emplace(WINDOW.get()).second && AREA.containsPoint(placeWindowBox(WINDOW).middle()))
+            members.push_back(WINDOW);
+    }
+    return members;
+}
+
+// Dwindle: each window takes half of what is left, split across its longer side.
+static std::vector<CBox> placeTiles(CBox area, size_t count, double gap) {
+    std::vector<CBox> tiles;
+    for (size_t i = 0; i < count; ++i) {
+        if (i + 1 == count) {
+            tiles.push_back(area);
+            break;
+        }
+        if (area.width >= area.height) {
+            const double W = std::round((area.width - gap) / 2.0);
+            tiles.push_back(CBox{area.x, area.y, W, area.height});
+            area = CBox{area.x + W + gap, area.y, area.width - W - gap, area.height};
+        } else {
+            const double H = std::round((area.height - gap) / 2.0);
+            tiles.push_back(CBox{area.x, area.y, area.width, H});
+            area = CBox{area.x, area.y + H + gap, area.width, area.height - H - gap};
+        }
+    }
+    return tiles;
+}
+
+// dropped: windows were just let go of, so one dropped on another's tile
+// takes its turn there.
+static void tilePlace(int place, const PHLMONITOR& monitor, bool dropped) {
+    const auto             MEMBERS = placeMembers(place, monitor);
+    auto&                  order   = g_placeOrder[place];
+    std::vector<PHLWINDOW> tiled;
+    for (const auto& ref : order)
+        if (const auto WINDOW = ref.lock(); WINDOW && std::ranges::contains(MEMBERS, WINDOW) && !std::ranges::contains(tiled, WINDOW))
+            tiled.push_back(WINDOW);
+
+    const auto tileUnder = [&tiled](const PHLWINDOW& moving) -> int {
+        const auto CENTER = placeWindowBox(moving).middle();
+        for (size_t i = 0; i < tiled.size(); ++i)
+            if (tiled[i] != moving)
+                if (const auto IT = g_placeTiled.find(tiled[i].get()); IT != g_placeTiled.end() && IT->second.containsPoint(CENTER))
+                    return sc<int>(i);
+        return -1;
+    };
+
+    if (dropped) {
+        for (size_t i = 0; i < tiled.size(); ++i) {
+            const auto IT = g_placeTiled.find(tiled[i].get());
+            if (IT == g_placeTiled.end() || IT->second.containsPoint(placeWindowBox(tiled[i]).middle()))
+                continue;
+            if (const int OTHER = tileUnder(tiled[i]); OTHER >= 0)
+                std::swap(tiled[i], tiled[OTHER]);
+        }
+    }
+
+    std::vector<PHLWINDOW> arrived;
+    for (const auto& window : MEMBERS)
+        if (!std::ranges::contains(tiled, window))
+            arrived.push_back(window);
+    std::ranges::sort(arrived, [](const PHLWINDOW& a, const PHLWINDOW& b) {
+        const auto A = placeWindowBox(a).middle(), B = placeWindowBox(b).middle();
+        return A.y != B.y ? A.y < B.y : A.x < B.x;
+    });
+    for (const auto& window : arrived) {
+        const int AT = g_placeOpened.erase(window.get()) ? -1 : tileUnder(window);
+        tiled.insert(AT >= 0 ? tiled.begin() + AT : tiled.end(), window);
+    }
+
+    order.assign(tiled.begin(), tiled.end());
+    if (tiled.empty())
+        return;
+
+    const auto GAPS  = ScrollOverview::Config::getCssGapData("general:gaps_in");
+    const auto AREA  = canvasFillArea(monitor, nullptr).translate(placeCamera(place));
+    const auto TILES = placeTiles(AREA, tiled.size(), 2.0 * std::max<int64_t>(0, GAPS.m_left));
+    for (size_t i = 0; i < tiled.size(); ++i) {
+        const auto WINDOW = tiled[i];
+        const auto TARGET = WINDOW->layoutTarget();
+        if (!TARGET)
+            continue;
+        const double BORDER = WINDOW->getRealBorderSize();
+        const CBox   BOX{TILES[i].x + BORDER, TILES[i].y + BORDER, std::max(1.0, TILES[i].width - 2 * BORDER), std::max(1.0, TILES[i].height - 2 * BORDER)};
+        g_placeTiled[WINDOW.get()] = BOX;
+        const auto NOW             = placeWindowBox(WINDOW);
+        if (NOW.pos().distanceSq(BOX.pos()) < 1.0 && NOW.size().distanceSq(BOX.size()) < 1.0)
+            continue;
+        TARGET->rememberFloatingSize(BOX.size());
+        TARGET->setPositionGlobal(BOX);
+        WINDOW->sendWindowSize(true);
+    }
+}
+
+static bool tilingPlaces() {
+    return ScrollOverview::Config::getCanvasPlaces() && ScrollOverview::Config::getCanvasTilePlaces();
+}
+
+// Every frame, once for all screens: a place whose windows changed tiles
+// again. Nothing moves while a button is down, so a window can be dragged
+// through places; once let go, one moved off its tile goes back or swaps.
+void CScrollOverview::reconcilePlaces() {
+    if (closing || !isCanvasDesktop() || !tilingPlaces() || g_placeHeldButtons > 0 || g_pInputManager->hasHeldButtons())
+        return;
+    static Time::steady_tp lastRun;
+    const auto             NOW = Time::steadyNow();
+    if (NOW - lastRun < std::chrono::milliseconds(8))
+        return;
+    lastRun            = NOW;
+    const bool DROPPED = std::exchange(g_placeReleased, false);
+
+    for (int place = 1; place <= 10; ++place) {
+        const auto MONITOR = placeMonitor(place);
+        if (!MONITOR)
+            continue;
+        const auto MEMBERS = placeMembers(place, MONITOR);
+        size_t     live    = 0;
+        bool       changed = false;
+        for (const auto& ref : g_placeOrder[place]) {
+            const auto WINDOW = ref.lock();
+            if (!WINDOW || !std::ranges::contains(MEMBERS, WINDOW))
+                changed = true;
+            else
+                ++live;
+        }
+        changed = changed || live != MEMBERS.size();
+        if (!changed && DROPPED)
+            changed = std::ranges::any_of(MEMBERS, [](const PHLWINDOW& window) {
+                const auto IT = g_placeTiled.find(window.get());
+                return IT == g_placeTiled.end() || placeWindowBox(window).pos().distanceSq(IT->second.pos()) > 4.0 ||
+                    placeWindowBox(window).size().distanceSq(IT->second.size()) > 4.0;
+            });
+        if (changed)
+            tilePlace(place, MONITOR, DROPPED);
+    }
+}
+
+// SUPER + SHIFT + arrows in a tiled place swap the window with its neighbour
+// that way; past the last one, it goes to the place the next screen that way
+// is showing.
+bool CScrollOverview::nudgeInPlace(PHLWINDOW window, const Vector2D& direction) {
+    window = getOverviewWindowToShow(window);
+    if (!isCanvasDesktop() || !tilingPlaces() || !placeTileable(window))
+        return false;
+    const auto CENTER  = placeWindowBox(window).middle();
+    int        place   = 0;
+    PHLMONITOR monitor = nullptr;
+    for (int candidate = 1; candidate <= 10 && !place; ++candidate)
+        if (const auto M = placeMonitor(candidate); M && placeWorldBox(candidate, M).containsPoint(CENTER)) {
+            place   = candidate;
+            monitor = M;
+        }
+    if (!place)
+        return false;
+
+    const auto that_way = [&direction](const Vector2D& delta) {
+        const double ALONG  = delta.x * direction.x + delta.y * direction.y;
+        const double ACROSS = std::abs(delta.x * direction.y - delta.y * direction.x);
+        return ALONG > 1.0 && ACROSS <= ALONG ? delta.size() : -1.0;
+    };
+
+    tilePlace(place, monitor, false);
+    auto&  order = g_placeOrder[place];
+    int    self = -1, best = -1;
+    double nearest = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < order.size(); ++i) {
+        const auto OTHER = order[i].lock();
+        if (OTHER == window) {
+            self = sc<int>(i);
+            continue;
+        }
+        if (!OTHER)
+            continue;
+        if (const double DISTANCE = that_way(placeWindowBox(OTHER).middle() - CENTER); DISTANCE >= 0 && DISTANCE < nearest) {
+            nearest = DISTANCE;
+            best    = sc<int>(i);
+        }
+    }
+    if (self >= 0 && best >= 0) {
+        checkpointCanvas();
+        std::swap(order[self], order[best]);
+        tilePlace(place, monitor, false);
+        return true;
+    }
+
+    PHLMONITOR next = nullptr;
+    nearest         = std::numeric_limits<double>::max();
+    for (const auto& other : State::monitorState()->monitors()) {
+        if (!other || !other->m_enabled || other == monitor)
+            continue;
+        if (const double DISTANCE = that_way(other->logicalBox().middle() - monitor->logicalBox().middle()); DISTANCE >= 0 && DISTANCE < nearest) {
+            nearest = DISTANCE;
+            next    = other;
+        }
+    }
+    auto* canvas = next ? canvasOf(scrollOverviewForMonitor(next)) : nullptr;
+    if (!canvas)
+        return true;
+    const int TO = placeAt(next, next->m_position + next->m_size / 2.0 + canvas->viewOffset->goal());
+    if (!TO)
+        return true;
+    checkpointCanvas();
+    const auto AREA   = placeWorldBox(TO, next);
+    const auto SIZE   = placeWindowBox(window).size();
+    const auto TARGET = window->layoutTarget();
+    TARGET->setPositionGlobal(CBox{AREA.middle() - SIZE / 2.0, SIZE});
+    TARGET->warpPositionSize();
+    std::erase_if(order, [&window](const PHLWINDOWREF& ref) { return ref.lock() == window; });
+    g_placeOrder[TO].push_back(window);
+    tilePlace(place, monitor, false);
+    tilePlace(TO, next, false);
+    canvas->canvasAdoptFocus(window);
+    return true;
+}
+
+// Zoomed out, each place a screen has is outlined and numbered, just outside
+// it, since tiled windows cover all of it.
+void CScrollOverview::renderPlaceOutlines(PHLMONITOR monitor) {
+    if (!monitor || !ScrollOverview::Config::getCanvasPlaces() || !isCanvasNavigationActive())
+        return;
+    const float FADE = overviewProgress();
+    if (FADE <= 0.01F)
+        return;
+    const float SCALE = std::max(monitor->m_scale, 0.01F);
+    const auto  THEME = SpatialOverview::Hud::theme();
+    for (int place = 1; place <= 10; ++place) {
+        const auto OWNER = placeMonitor(place);
+        if (!OWNER)
+            continue;
+        const auto SCREEN = canvasWorldToScreen(placeWorldBox(place, OWNER));
+        CBox       box{(SCREEN.pos() - monitor->m_position) * SCALE, SCREEN.size() * SCALE};
+        if (!box.overlaps(CBox{{}, monitor->m_size * SCALE}))
+            continue;
+        const CBox INNER = box.copy().round();
+        box.expand(8.F * SCALE).round();
+        CBorderPassElement::SBorderData border;
+        border.box           = box;
+        border.grad1         = Config::CGradientValueData{THEME.text};
+        border.a             = 0.6F * FADE;
+        border.borderSize    = std::max(2, sc<int>(std::round(2.F * SCALE)));
+        border.round         = sc<int>(std::round(14.F * SCALE));
+        border.outerRound    = border.round;
+        border.roundingPower = 2.F;
+        g_pHyprRenderer->m_renderPass.add(makeUnique<CBorderPassElement>(border));
+
+        // The number on a badge in the corner, over the windows.
+        const float                 BADGE = 40.F * SCALE;
+        CRectPassElement::SRectData badge;
+        badge.box           = CBox{INNER.x + 14.F * SCALE, INNER.y + 14.F * SCALE, place == 10 ? BADGE * 1.4F : BADGE, BADGE}.round();
+        badge.color         = THEME.accent;
+        badge.color.a       = 0.92F * FADE;
+        badge.round         = sc<int>(std::round(9.F * SCALE));
+        badge.roundingPower = 2.F;
+        g_pHyprRenderer->m_renderPass.add(makeUnique<CRectPassElement>(badge));
+        drawCanvasText(std::to_string(place), CBox{badge.box.x + 12.F * SCALE, badge.box.y + 5.F * SCALE, badge.box.width, BADGE}, CHyprColor{0.04F, 0.04F, 0.05F, FADE},
+                       sc<int>(std::round(20.F * SCALE)));
+    }
 }
 
 bool CScrollOverview::canvasPlaceAction(const std::string& action) {
@@ -10888,74 +11269,141 @@ bool CScrollOverview::canvasPlaceAction(const std::string& action) {
     // nothing on the canvas (and succeed, so bindings skip their fallback).
     if (!ScrollOverview::Config::getCanvasPlaces())
         return true;
-    // You are at the place of the workspace you were on.
-    if (g_place == 0) {
-        const auto ID      = MONITOR->m_activeWorkspace ? MONITOR->m_activeWorkspace->m_id : 1;
-        g_place            = ID >= 1 && ID <= 10 ? sc<int>(ID) : 1;
-        g_placeAnchor      = g_place;
-        g_placeAnchorCamera = viewOffset->goal();
-    }
+
+    const auto canvasFor = [this, &MONITOR](const PHLMONITOR& monitor) -> CScrollOverview* {
+        return monitor == MONITOR ? this : canvasOf(scrollOverviewForMonitor(monitor));
+    };
+    // Where a screen's camera is headed, not where it is on the way.
+    const auto placeHere = [&MONITOR, this] { return placeAt(MONITOR, MONITOR->m_position + MONITOR->m_size / 2.0 + viewOffset->goal()); };
+    const auto claim     = [&MONITOR](int place) {
+        auto monitor = placeMonitor(place);
+        if (!monitor) {
+            monitor                 = MONITOR;
+            g_places[place].monitor = MONITOR;
+        }
+        return monitor;
+    };
 
     // Zoomed out, the view glides there and stays zoomed out, on the minimap;
     // at 100% the minimap shows for a moment while you travel.
-    const auto go = [this](int place) {
+    const auto go = [&](int place) {
         if (place < 1 || place > 10)
             return false;
-        const auto FOCUSED            = getOverviewWindowToShow(Desktop::focusState()->window());
-        g_places[g_place]             = {.camera = viewOffset->goal(), .focus = FOCUSED};
-        if (place != g_place)
-            g_previousPlace = g_place;
-        g_place = place;
-        markCanvasCameraActive(pMonitor.lock());
-        if (!canvasNavigationActive) {
+        const auto TARGETMONITOR = claim(place);
+        auto*      canvas        = canvasFor(TARGETMONITOR);
+        if (!canvas || canvas->closing || !canvas->isCanvasDesktop())
+            return false;
+        const auto FOCUSED = getOverviewWindowToShow(Desktop::focusState()->window());
+        if (const int HERE = placeHere(); HERE) {
+            g_places[HERE].focus = FOCUSED;
+            if (HERE != place)
+                g_previousPlace = HERE;
+        }
+        markCanvasCameraActive(TARGETMONITOR);
+        if (!canvas->canvasNavigationActive) {
             const auto NOW = Time::steadyNow();
             if (NOW >= g_minimapFlashUntil)
                 g_minimapFlashStart = NOW;
             g_minimapFlashUntil = NOW + std::chrono::milliseconds(1400);
         }
-        *viewOffset = placeCamera(place);
-        // Focus what had it there, or nothing that is not there.
-        const auto REMEMBERED = g_places.contains(place) ? g_places.at(place).focus.lock() : PHLWINDOW{};
-        const auto VIEW       = canvasScreensBox().translate(placeCamera(place));
-        if (shouldShowOverviewWindow(REMEMBERED) && VIEW.containsPoint(REMEMBERED->m_realPosition->goal() + REMEMBERED->m_realSize->goal() / 2.0))
-            canvasAdoptFocus(REMEMBERED);
-        else if (FOCUSED && !VIEW.containsPoint(FOCUSED->m_realPosition->goal() + FOCUSED->m_realSize->goal() / 2.0))
+        // Linked, this screen keeps the lead and the others follow it, so it
+        // moves by what puts that screen at the place.
+        if (TARGETMONITOR != MONITOR && ScrollOverview::Config::getCanvasLinkedScreens()) {
+            const float ZOOM     = std::max(scale->goal(), 0.01F);
+            const auto  DISTANCE = (TARGETMONITOR->m_position + TARGETMONITOR->m_size / 2.0) - (MONITOR->m_position + MONITOR->m_size / 2.0);
+            *viewOffset          = placeCamera(place) - DISTANCE * (1.0 / ZOOM - 1.0);
+        } else
+            *canvas->viewOffset = placeCamera(place);
+        if (TARGETMONITOR != MONITOR) {
+            Desktop::focusState()->rawMonitorFocus(TARGETMONITOR);
+            Pointer::pointerController()->warpTo(TARGETMONITOR->logicalBox().middle(), true);
+        }
+
+        // Focus what had it there, or else a window there, or nothing.
+        const auto VIEW     = placeWorldBox(place, TARGETMONITOR);
+        const auto inView   = [&VIEW](const PHLWINDOW& window) { return shouldShowOverviewWindow(window) && VIEW.containsPoint(placeWindowBox(window).middle()); };
+        auto       focusing = g_places.contains(place) ? g_places.at(place).focus.lock() : PHLWINDOW{};
+        if (!inView(focusing)) {
+            focusing = nullptr;
+            for (const auto& ref : g_placeOrder[place])
+                if (const auto WINDOW = ref.lock(); inView(WINDOW)) {
+                    focusing = WINDOW;
+                    break;
+                }
+        }
+        if (!focusing)
+            for (const auto& windowRef : Desktop::windowState()->windows())
+                if (const auto WINDOW = getOverviewWindowToShow(windowRef); inView(WINDOW) && !WINDOW->m_pinned) {
+                    focusing = WINDOW;
+                    break;
+                }
+        if (focusing)
+            canvas->canvasAdoptFocus(focusing);
+        else
             Desktop::focusState()->fullWindowFocus(nullptr, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
+        canvas->damage();
         damage();
         return true;
     };
 
     if (action.starts_with("go ")) {
         const auto WHERE = action.substr(3);
+        const int  HERE  = placeHere();
         if (WHERE == "back")
-            return go(g_previousPlace ? g_previousPlace : g_place);
-        // The place next door, empty or not, like the workspace keys: with
-        // all your windows at one place there is still somewhere to go.
-        if (WHERE == "next" || WHERE == "prev")
-            return go(((g_place - 1 + (WHERE == "next" ? 1 : -1)) % 10 + 10) % 10 + 1);
+            return go(g_previousPlace ? g_previousPlace : (HERE ? HERE : 1));
+        // The place next door among this screen's, empty or not, like the
+        // workspace keys: with all your windows at one place there is still
+        // somewhere to go.
+        if (WHERE == "next" || WHERE == "prev") {
+            std::vector<int> mine;
+            for (int place = 1; place <= 10; ++place)
+                if (const auto OWNER = placeMonitor(place); !OWNER || OWNER == MONITOR)
+                    mine.push_back(place);
+            if (mine.empty())
+                return true;
+            const auto IT = std::ranges::find(mine, HERE);
+            if (IT == mine.end())
+                return go(mine.front());
+            const int STEP = WHERE == "next" ? 1 : -1;
+            const int SIZE = sc<int>(mine.size());
+            return go(mine[((IT - mine.begin()) + STEP + SIZE) % SIZE]);
+        }
         int place = 0;
         try { place = std::stoi(WHERE); } catch (...) { return false; }
         return go(place);
     }
 
-    // send N [stay]: the focused window to place N, at the same spot on the screen.
+    // send N [stay]: the focused window to place N, at the same spot on the
+    // screen (tiled places find it a spot of their own).
     int place = 0;
     try { place = std::stoi(action.substr(5)); } catch (...) { return false; }
     const bool STAY   = action.ends_with(" stay");
     const auto WINDOW = getOverviewWindowToShow(Desktop::focusState()->window());
     const auto TARGET = shouldShowOverviewWindow(WINDOW) && !WINDOW->m_pinned ? WINDOW->layoutTarget() : nullptr;
-    if (place < 1 || place > 10 || !TARGET || place == g_place)
+    const int  HERE   = placeHere();
+    if (place < 1 || place > 10 || !TARGET || place == HERE)
         return place >= 1 && place <= 10;
     checkpointCanvas();
-    const auto DELTA = placeCamera(place) - viewOffset->goal();
-    TARGET->setPositionGlobal(CBox{WINDOW->m_realPosition->goal() + DELTA, WINDOW->m_realSize->goal()});
+    const auto TO   = claim(place);
+    const auto DEST = placeWorldBox(place, TO);
+    const auto FROM = HERE ? placeWorldBox(HERE, MONITOR) : CBox{MONITOR->m_position + viewOffset->goal(), MONITOR->m_size};
+    auto       box  = placeWindowBox(WINDOW);
+    box.width       = std::min(box.width, DEST.width);
+    box.height      = std::min(box.height, DEST.height);
+    box.x           = DEST.x + std::clamp(box.x - FROM.x, 0.0, DEST.width - box.width);
+    box.y           = DEST.y + std::clamp(box.y - FROM.y, 0.0, DEST.height - box.height);
+    TARGET->setPositionGlobal(box);
     TARGET->warpPositionSize();
     WINDOW->sendWindowSize(true);
+    for (auto& [_, order] : g_placeOrder)
+        std::erase_if(order, [&WINDOW](const PHLWINDOWREF& ref) { return ref.lock() == WINDOW; });
+    g_placeOrder[place].push_back(WINDOW);
     if (STAY) {
         Desktop::focusState()->fullWindowFocus(nullptr, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
         return true;
     }
     go(place);
-    canvasAdoptFocus(WINDOW);
+    if (auto* canvas = canvasFor(TO))
+        canvas->canvasAdoptFocus(WINDOW);
     return true;
 }
