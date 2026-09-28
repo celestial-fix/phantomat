@@ -10852,7 +10852,7 @@ bool CScrollOverview::flightDeckAction(const std::string& action) {
             if (shouldShowOverviewWindow(w) && w->m_workspace==ws) return followCanvasWindow(w,true,true);
         return false;
     }
-    if (action.starts_with("go ") || action.starts_with("send "))
+    if (action.starts_with("go ") || action.starts_with("send ") || action.starts_with("assign "))
         return canvasPlaceAction(action);
     return false;
 }
@@ -10862,15 +10862,15 @@ bool CScrollOverview::flightDeckAction(const std::string& action) {
 // window there and follows it (SHIFT + ALT + SUPER + N: without following),
 // SUPER + TAB / SHIFT + SUPER + TAB step through the places of the screen you
 // are on, CTRL + SUPER + TAB goes back to the place before. A place is one
-// screen's worth of canvas and belongs to one screen: canvas:place_monitors
-// names it, otherwise it stays on the screen it was first visited from. Each
-// screen's places are a row, their columns a desk-width and more apart, so
-// linked screens land together on the places of the same column. With
+// screen's worth of canvas and belongs to one screen: the one it was first
+// visited from, unless canvas:place_monitors names one, until SHIFT + ALT +
+// SUPER + arrows move it (and its windows) to another screen. Where places
+// are is remembered across restarts. Place N is column N of the canvas, a
+// desk-width and more from the next, on the row of its screen. With
 // canvas:tile_places the windows in a place tile to fill its screen, and
 // each place remembers which window had focus there.
 struct SCanvasPlace {
-    PHLWINDOWREF  focus;
-    PHLMONITORREF monitor;
+    PHLWINDOWREF focus;
 };
 static std::unordered_map<int, SCanvasPlace>                   g_places;
 static int                                                     g_previousPlace = 0;
@@ -10897,16 +10897,11 @@ void notePlacePointerButton(bool pressed) {
         g_placeReleased = true;
 }
 
-static const std::map<int, std::string>& placeMonitorNames() {
-    static std::string                parsed;
-    static std::map<int, std::string> names;
-    auto                              config = ScrollOverview::Config::getCanvasPlaceMonitors();
-    if (config == parsed)
-        return names;
-    parsed = config;
-    names.clear();
-    std::ranges::replace(config, ',', ' ');
-    std::istringstream stream{config};
+// "1-5:DP-1 6:HDMI-A-1", separated by spaces or commas.
+static std::map<int, std::string> parsePlaceMonitors(std::string text) {
+    std::map<int, std::string> names;
+    std::ranges::replace(text, ',', ' ');
+    std::istringstream stream{text};
     std::string        entry;
     while (stream >> entry) {
         const auto COLON = entry.find(':');
@@ -10925,17 +10920,60 @@ static const std::map<int, std::string>& placeMonitorNames() {
     return names;
 }
 
+static std::filesystem::path placeMonitorsPath() {
+    std::filesystem::path base;
+    if (const char* state = std::getenv("XDG_STATE_HOME"); state && *state)
+        base = state;
+    else
+        base = std::filesystem::path{std::getenv("HOME") ? std::getenv("HOME") : "/tmp"} / ".local" / "state";
+    return base / "spatial-overview" / "place-monitors";
+}
+
+// Where places were put while running; wins over canvas:place_monitors.
+static std::map<int, std::string>& assignedPlaceMonitors() {
+    static std::optional<std::map<int, std::string>> assigned;
+    if (!assigned) {
+        std::ifstream in{placeMonitorsPath()};
+        std::string   text{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+        assigned = parsePlaceMonitors(text);
+    }
+    return *assigned;
+}
+
+static void assignPlaceMonitor(int place, const std::string& monitor) {
+    auto& assigned  = assignedPlaceMonitors();
+    assigned[place] = monitor;
+    std::error_code error;
+    const auto      PATH = placeMonitorsPath();
+    std::filesystem::create_directories(PATH.parent_path(), error);
+    std::ofstream out{PATH, std::ios::trunc};
+    for (const auto& [number, name] : assigned)
+        out << number << ':' << name << '\n';
+}
+
+static std::optional<std::string> placeMonitorName(int place) {
+    if (const auto IT = assignedPlaceMonitors().find(place); IT != assignedPlaceMonitors().end())
+        return IT->second;
+    static std::string                config;
+    static std::map<int, std::string> configured;
+    if (const auto CONFIG = ScrollOverview::Config::getCanvasPlaceMonitors(); CONFIG != config) {
+        config     = CONFIG;
+        configured = parsePlaceMonitors(CONFIG);
+    }
+    if (const auto IT = configured.find(place); IT != configured.end())
+        return IT->second;
+    return std::nullopt;
+}
+
 // The screen a place lands on; none for a place never visited that no
-// setting names (or whose screen is gone).
+// setting names, or whose screen is gone.
 static PHLMONITOR placeMonitor(int place) {
-    const auto& NAMES = placeMonitorNames();
-    if (const auto IT = NAMES.find(place); IT != NAMES.end())
-        for (const auto& monitor : State::monitorState()->monitors())
-            if (monitor && monitor->m_enabled && monitor->m_name == IT->second)
-                return monitor;
-    if (const auto IT = g_places.find(place); IT != g_places.end())
-        if (const auto MONITOR = IT->second.monitor.lock(); MONITOR && MONITOR->m_enabled)
-            return MONITOR;
+    const auto NAME = placeMonitorName(place);
+    if (!NAME)
+        return nullptr;
+    for (const auto& monitor : State::monitorState()->monitors())
+        if (monitor && monitor->m_enabled && monitor->m_name == *NAME)
+            return monitor;
     return nullptr;
 }
 
@@ -10956,21 +10994,10 @@ static CBox canvasScreensBox() {
     return box;
 }
 
-// A named place's column is its rank among its screen's named places, so the
-// screens' first places share a column, then their second ones, and so on.
-// Unnamed places come after all of those.
-static int placeColumn(int place) {
-    const auto& NAMES = placeMonitorNames();
-    const auto  IT    = NAMES.find(place);
-    if (IT == NAMES.end())
-        return NAMES.empty() ? place - 1 : 10 + place - 1;
-    return sc<int>(std::ranges::count_if(NAMES, [&](const auto& other) { return other.first < place && other.second == IT->second; }));
-}
-
 // Rounded, so a small change to the screens does not move every place.
 static Vector2D placeCamera(int place) {
     const double PITCH = std::max(1000.0, std::ceil(canvasScreensBox().width * 1.25 / 1000.0) * 1000.0);
-    return Vector2D{placeColumn(place) * PITCH, 0.0};
+    return Vector2D{(place - 1) * PITCH, 0.0};
 }
 
 static CBox placeWorldBox(int place, const PHLMONITOR& monitor) {
@@ -11278,8 +11305,8 @@ bool CScrollOverview::canvasPlaceAction(const std::string& action) {
     const auto claim     = [&MONITOR](int place) {
         auto monitor = placeMonitor(place);
         if (!monitor) {
-            monitor                 = MONITOR;
-            g_places[place].monitor = MONITOR;
+            monitor = MONITOR;
+            assignPlaceMonitor(place, MONITOR->m_name);
         }
         return monitor;
     };
@@ -11351,13 +11378,11 @@ bool CScrollOverview::canvasPlaceAction(const std::string& action) {
         const int  HERE  = placeHere();
         if (WHERE == "back")
             return go(g_previousPlace ? g_previousPlace : (HERE ? HERE : 1));
-        // The place next door among this screen's, empty or not, like the
-        // workspace keys: with all your windows at one place there is still
-        // somewhere to go.
+        // The place next door among this screen's, empty or not.
         if (WHERE == "next" || WHERE == "prev") {
             std::vector<int> mine;
             for (int place = 1; place <= 10; ++place)
-                if (const auto OWNER = placeMonitor(place); !OWNER || OWNER == MONITOR)
+                if (placeMonitor(place) == MONITOR)
                     mine.push_back(place);
             if (mine.empty())
                 return true;
@@ -11371,6 +11396,74 @@ bool CScrollOverview::canvasPlaceAction(const std::string& action) {
         int place = 0;
         try { place = std::stoi(WHERE); } catch (...) { return false; }
         return go(place);
+    }
+
+    // assign <left|right|up|down|screen>: the place this screen shows moves,
+    // with its windows, to that screen, and you go with it. This screen
+    // shows the place you were at before, or another of its own.
+    if (action.starts_with("assign ")) {
+        const auto WHERE = action.substr(7);
+        const int  PLACE = placeHere();
+        if (!PLACE)
+            return true;
+        PHLMONITOR to = nullptr;
+        if (WHERE == "left" || WHERE == "right" || WHERE == "up" || WHERE == "down") {
+            const Vector2D DIRECTION = WHERE == "left" ? Vector2D{-1, 0} : WHERE == "right" ? Vector2D{1, 0} : WHERE == "up" ? Vector2D{0, -1} : Vector2D{0, 1};
+            double         nearest   = std::numeric_limits<double>::max();
+            for (const auto& other : State::monitorState()->monitors()) {
+                if (!other || !other->m_enabled || other == MONITOR)
+                    continue;
+                const auto   DELTA  = other->logicalBox().middle() - MONITOR->logicalBox().middle();
+                const double ALONG  = DELTA.x * DIRECTION.x + DELTA.y * DIRECTION.y;
+                const double ACROSS = std::abs(DELTA.x * DIRECTION.y - DELTA.y * DIRECTION.x);
+                if (ALONG > 1.0 && ACROSS <= ALONG && DELTA.size() < nearest) {
+                    nearest = DELTA.size();
+                    to      = other;
+                }
+            }
+        } else
+            for (const auto& other : State::monitorState()->monitors())
+                if (other && other->m_enabled && other->m_name == WHERE)
+                    to = other;
+        if (!to || to == MONITOR)
+            return true;
+
+        checkpointCanvas();
+        const auto             FROMBOX = placeWorldBox(PLACE, MONITOR);
+        std::vector<PHLWINDOW> moving;
+        for (const auto& windowRef : Desktop::windowState()->windows())
+            if (const auto WINDOW = getOverviewWindowToShow(windowRef);
+                shouldShowOverviewWindow(WINDOW) && !WINDOW->m_pinned && !std::ranges::contains(moving, WINDOW) && FROMBOX.containsPoint(placeWindowBox(WINDOW).middle()))
+                moving.push_back(WINDOW);
+        assignPlaceMonitor(PLACE, to->m_name);
+        const auto     TOBOX = placeWorldBox(PLACE, to);
+        const Vector2D RATIO{TOBOX.width / std::max(1.0, FROMBOX.width), TOBOX.height / std::max(1.0, FROMBOX.height)};
+        for (const auto& window : moving) {
+            const auto TARGET = window->layoutTarget();
+            if (!TARGET)
+                continue;
+            const auto     BOX  = placeWindowBox(window);
+            const Vector2D SIZE{std::min(BOX.width, TOBOX.width), std::min(BOX.height, TOBOX.height)};
+            Vector2D       pos = TOBOX.pos() + (BOX.pos() - FROMBOX.pos()) * RATIO;
+            pos.x              = std::clamp(pos.x, TOBOX.x, TOBOX.x + TOBOX.width - SIZE.x);
+            pos.y              = std::clamp(pos.y, TOBOX.y, TOBOX.y + TOBOX.height - SIZE.y);
+            TARGET->setPositionGlobal(CBox{pos, SIZE});
+            TARGET->warpPositionSize();
+            window->sendWindowSize(true);
+            g_placeTiled.erase(window.get());
+        }
+        if (tilingPlaces())
+            tilePlace(PLACE, to, false);
+
+        if (!ScrollOverview::Config::getCanvasLinkedScreens()) {
+            int stay = g_previousPlace != PLACE && placeMonitor(g_previousPlace) == MONITOR ? g_previousPlace : 0;
+            for (int place = 1; place <= 10 && !stay; ++place)
+                if (placeMonitor(place) == MONITOR)
+                    stay = place;
+            if (stay)
+                *viewOffset = placeCamera(stay);
+        }
+        return go(PLACE);
     }
 
     // send N [stay]: the focused window to place N, at the same spot on the

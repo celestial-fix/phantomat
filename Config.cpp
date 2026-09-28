@@ -71,9 +71,9 @@ SDispatcher* findDispatcher(const std::string_view name) {
         },
         {
             .name            = "canvas",
-            .argPattern      = std::regex{R"(^((place|viewport)[ \t]+-?[0-9]+[ \t]+-?[0-9]+|area[ \t]+[1-9][0-9]*|send[ \t]+[1-9][0-9]*([ \t]+stay)?|go[ \t]+([1-9][0-9]*|next|prev|back)|refresh|arrange|land|back|frame|undo|redo|fit|summon|tune|fill|pin|noop|search([ \t]+[^"\\]+)?|zoom[ \t]+(in|out)|(pan|nudge)[ \t]+(left|right|up|down)|native|maximize|fullscreen|restore|experiment[ \t]+(baseline|landing|labels|alttab|areas|quiet|persist|depth|lens|all|next|prev|status)|alttab[ \t]+(next|prev)|switch[ \t]+(next|prev))$)"},
+            .argPattern      = std::regex{R"(^((place|viewport)[ \t]+-?[0-9]+[ \t]+-?[0-9]+|area[ \t]+[1-9][0-9]*|send[ \t]+[1-9][0-9]*([ \t]+stay)?|go[ \t]+([1-9][0-9]*|next|prev|back)|assign[ \t]+[^ \t\"\\]+|refresh|arrange|land|back|frame|undo|redo|fit|summon|tune|fill|pin|noop|search([ \t]+[^"\\]+)?|zoom[ \t]+(in|out)|(pan|nudge)[ \t]+(left|right|up|down)|native|maximize|fullscreen|restore|experiment[ \t]+(baseline|landing|labels|alttab|areas|quiet|persist|depth|lens|all|next|prev|status)|alttab[ \t]+(next|prev)|switch[ \t]+(next|prev))$)"},
             .typeArgError    = "expected a string argument",
-            .invalidArgError = "expected: search [text] | tune | fill | pin | noop | fit | summon | zoom in|out | pan/nudge left|right|up|down | undo | redo | arrange | land | back | frame | place <column> <row> | viewport <x> <y> | area <id> | go <place>|next|prev|back | send <place> [stay] | refresh | native | maximize | fullscreen | restore | experiment <name> | alttab next|prev | switch next|prev",
+            .invalidArgError = "expected: search [text] | tune | fill | pin | noop | fit | summon | zoom in|out | pan/nudge left|right|up|down | undo | redo | arrange | land | back | frame | place <column> <row> | viewport <x> <y> | area <id> | go <place>|next|prev|back | send <place> [stay] | assign left|right|up|down|<monitor> | refresh | native | maximize | fullscreen | restore | experiment <name> | alttab next|prev | switch next|prev",
             .luaFunction     = [](lua_State* L) { return dispatcherFactoryLua(L, "canvas"); },
         },
     };
@@ -358,7 +358,7 @@ static void registerConfigValues() {
                                   makeShared<CBoolValue>("plugin:spatialoverview:canvas:places", "workspace keys go to places on the canvas (experimental); off, they do nothing on the canvas", false));
     HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE,
                                   makeShared<CStringValue>("plugin:spatialoverview:canvas:place_monitors",
-                                                           "the screen each place lands on, as \"1-5:DP-1 6-10:HDMI-A-1\"; unlisted places stay on the screen they were first visited from",
+                                                           "starting screens for places, as \"1-5:DP-1 6-10:HDMI-A-1\"; a place is otherwise claimed by the screen it is first visited from, and canvas \"assign\" moves it for good",
                                                            Hyprlang::STRING{""}));
     HyprlandAPI::addConfigValueV2(SCROLLOVERVIEW_HANDLE,
                                   makeShared<CBoolValue>("plugin:spatialoverview:canvas:tile_places", "windows in a place tile to fill its screen", false));
